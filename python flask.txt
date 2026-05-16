@@ -1,0 +1,3833 @@
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
+import urllib.parse
+import json
+import random
+from werkzeug.security import check_password_hash
+
+app = Flask(__name__)
+CORS(app)
+
+# Database configuration
+params = urllib.parse.quote_plus(
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=ADEEL\\SQLEXPRESS;"
+    "DATABASE=Mental Health of Student in BIIT;"
+    "Trusted_Connection=yes;"
+)
+app.config["SQLALCHEMY_DATABASE_URI"] = f"mssql+pyodbc:///?odbc_connect={params}"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+
+# -------------------------
+# Helpers
+# -------------------------
+LIKERT_5 = {"Never": 0, "Rarely": 1, "Sometimes": 2, "Often": 3, "Always": 4}
+
+CATEGORY_TO_BUCKET = {
+    "AC": "stress", "IA": "stress", "FC": "stress", "CF": "stress",
+    "SC": "anxiety", "CT": "anxiety", "RE": "anxiety", "SH": "anxiety",
+    "SP": "depression", "FD": "depression", "PH": "depression",
+    "SE": "depression", "AD": "depression",
+}
+
+CATEGORY_WEIGHTS = {"SH": 2.0}
+
+
+def _parse_options_json(options_json):
+    if not options_json:
+        return []
+    try:
+        obj = json.loads(options_json)
+        if isinstance(obj, dict):
+            return list(obj.values())
+        if isinstance(obj, list):
+            return obj
+    except Exception:
+        pass
+    return []
+
+
+def get_student_id_by_arid(arid_no: str):
+    row = db.session.execute(
+        text("SELECT Student_ID FROM dbo.Students WHERE Arid_No = :a"),
+        {"a": arid_no},
+    ).fetchone()
+    return int(row[0]) if row else None
+
+
+def get_profile_value(student_id: int, feature_key: str):
+    row = db.session.execute(
+        text("""
+                SELECT TOP 1 spr.Response_Value
+                FROM dbo.Student_Profile_Response spr
+                JOIN dbo.Profile_Questions pq
+                    ON pq.Profile_Question_ID = spr.Profile_Question_ID
+                WHERE spr.Student_ID = :sid
+                  AND pq.Feature_Key = :fk
+                ORDER BY spr.Created_On DESC
+            """),
+        {"sid": student_id, "fk": feature_key},
+    ).fetchone()
+    return row[0] if row else None
+
+
+# ============================================================
+# CORE SCORING ENGINE (UPDATED FOR STRICT SH RULES)
+# ============================================================
+
+def calculate_full_weighted_scores(test_id: int):
+    # --- 1. Pull Gate answers with weights ---
+    gate_rows = db.session.execute(text("""
+        SELECT c.Category_Key, c.Category_Name, COALESCE(c.Category_Weight, 1.0) AS cat_weight,
+               COALESCE(cg.Question_Weight, 1.0) AS q_weight, CAST(a.Answer_Value AS FLOAT) AS score
+        FROM dbo.Student_Test_Answer a
+        JOIN dbo.Category_Gates cg ON cg.Gate_ID = a.Ref_ID
+        JOIN dbo.Categories c ON c.Category_ID = cg.Category_ID
+        WHERE a.Test_ID = :tid AND a.Item_Type = 'Gate'
+    """), {"tid": int(test_id)}).fetchall()
+
+    # --- 2. Pull Base deep-dive answers with weights ---
+    base_rows = db.session.execute(text("""
+        SELECT c.Category_Key, c.Category_Name, COALESCE(c.Category_Weight, 1.0) AS cat_weight,
+               COALESCE(b.Weight, 1.0) AS q_weight, CAST(a.Answer_Value AS FLOAT) AS score
+        FROM dbo.Student_Test_Answer a
+        JOIN dbo.DeepDive_Base_Questions b ON b.Base_ID = a.Ref_ID
+        JOIN dbo.Categories c ON c.Category_ID = b.Category_ID
+        WHERE a.Test_ID = :tid AND a.Item_Type = 'Base'
+    """), {"tid": int(test_id)}).fetchall()
+
+    # --- 3. Pull Sub deep-dive answers with weights ---
+    sub_rows = db.session.execute(text("""
+        SELECT c.Category_Key, c.Category_Name, COALESCE(c.Category_Weight, 1.0) AS cat_weight,
+               COALESCE(s.Weight, 1.0) AS q_weight, CAST(a.Answer_Value AS FLOAT) AS score
+        FROM dbo.Student_Test_Answer a
+        JOIN dbo.DeepDive_Sub_Questions s ON s.Sub_ID = a.Ref_ID
+        JOIN dbo.DeepDive_Base_Questions b ON b.Base_ID = s.Base_ID
+        JOIN dbo.Categories c ON c.Category_ID = b.Category_ID
+        WHERE a.Test_ID = :tid AND a.Item_Type = 'Sub'
+    """), {"tid": int(test_id)}).fetchall()
+
+    # --- 4. Aggregate per category ---
+    cat_data = {}
+
+    def _add_row(ck, cn, cat_w, q_w, score):
+        if ck not in cat_data:
+            cat_data[ck] = {"Category_Key": ck, "Category_Name": cn, "cat_weight": float(cat_w),
+                            "raw_sum": 0.0, "max_possible": 0.0, "question_count": 0}
+        entry = cat_data[ck]
+        entry["raw_sum"] += float(score) * float(q_w)
+        entry["max_possible"] += 4.0 * float(q_w)
+        entry["question_count"] += 1
+
+    for rows in [gate_rows, base_rows, sub_rows]:
+        for ck, cn, cw, qw, sc in rows:
+            _add_row(ck, cn, cw, qw, sc)
+
+    for entry in cat_data.values():
+        entry["normalized_pct"] = round((entry["raw_sum"] / entry["max_possible"]) * 100, 2) if entry[
+                                                                                                    "max_possible"] > 0 else 0.0
+
+    # --- 5. Compute bucket-level weighted contributions ---
+    buckets = {"stress": {"weighted_sum": 0.0, "weight_total": 0.0},
+               "anxiety": {"weighted_sum": 0.0, "weight_total": 0.0},
+               "depression": {"weighted_sum": 0.0, "weight_total": 0.0}}
+
+    for entry in cat_data.values():
+        bucket = CATEGORY_TO_BUCKET.get(entry["Category_Key"])
+        if bucket:
+            cw = entry["cat_weight"]
+            buckets[bucket]["weighted_sum"] += entry["normalized_pct"] * cw
+            buckets[bucket]["weight_total"] += cw
+
+    bucket_pct = {bname: round(bdata["weighted_sum"] / bdata["weight_total"], 2) if bdata["weight_total"] > 0 else 0.0
+                  for bname, bdata in buckets.items()}
+
+    # --- 6. SH Special Logic: Collect the MAX score (not average) ---
+    sh_gate_score = next((float(sc) for ck, cn, cw, qw, sc in gate_rows if ck == "SH"), None)
+    sh_base_max = max([float(sc) for ck, cn, cw, qw, sc in base_rows if ck == "SH"], default=None)
+    sh_sub_max = max([float(sc) for ck, cn, cw, qw, sc in sub_rows if ck == "SH"], default=None)
+
+    return {
+        "bucket_pct": bucket_pct,
+        "cat_data": cat_data,
+        "sh_gate_score": sh_gate_score,
+        "sh_base_max": sh_base_max,
+        "sh_sub_max": sh_sub_max
+    }
+
+
+def determine_severity(bucket_pct: dict, sh_gate_score, sh_base_max, sh_sub_max):
+    max_pct = max(bucket_pct.values()) if bucket_pct else 0
+    dominant = max(bucket_pct, key=bucket_pct.get) if bucket_pct else "stress"
+
+    if max_pct < 20:
+        severity = "general_wellness"
+    elif max_pct < 40:
+        severity = "mild"
+    elif max_pct < 60:
+        severity = "moderate"
+    elif max_pct < 80:
+        severity = "high"
+    else:
+        severity = "severe"
+
+    # --- STRICT SH OVERRIDE ---
+    # If ANY SH question (gate, base, or sub) is >= 1 (Rarely), instantly lock to "severe"
+    if (sh_gate_score is not None and sh_gate_score >= 1) or \
+            (sh_base_max is not None and sh_base_max >= 1) or \
+            (sh_sub_max is not None and sh_sub_max >= 1):
+        severity = "severe"
+        dominant = "anxiety"  # SH always maps to anxiety
+
+    return dominant.capitalize(), severity
+
+
+def build_test_summary(test_id: int):
+    scored = calculate_full_weighted_scores(int(test_id))
+    bucket_pct = scored["bucket_pct"]
+
+    dominant_disease, severity = determine_severity(
+        bucket_pct, scored["sh_gate_score"], scored["sh_base_max"], scored["sh_sub_max"]
+    )
+
+    if severity == "general_wellness":
+        pie_pct = {"stress": 0, "anxiety": 0, "depression": 0}
+    else:
+        active = {k: v for k, v in bucket_pct.items() if v > 0}
+        total = sum(active.values())
+        normalized = {k: round((v / total) * 100) for k, v in active.items()} if total > 0 else {"stress": 0,
+                                                                                                 "anxiety": 0,
+                                                                                                 "depression": 0}
+        for k in ["stress", "anxiety", "depression"]: normalized.setdefault(k, 0)
+
+        current = sum(normalized.values())
+        if current != 100 and current > 0:
+            max_bucket = max(normalized, key=normalized.get)
+            normalized[max_bucket] += (100 - current)
+        pie_pct = normalized
+
+    triggered_all = get_triggered_categories_for_test(int(test_id))
+    triggered_sorted = sorted(triggered_all, key=lambda x: x["Gate_Score"], reverse=True)
+    sh_item = next((x for x in triggered_sorted if x["Category_Key"] == "SH"), None)
+    non_sh = [x for x in triggered_sorted if x["Category_Key"] != "SH"]
+
+    triggered_categories = ([sh_item] + non_sh[:2]) if sh_item else triggered_sorted[:3]
+
+    return {
+        "triggered_all": triggered_all,
+        "triggered_categories": triggered_categories,
+        "triggered_count": len(triggered_all),
+        "pie": pie_pct,
+        "Dominant_Disease": dominant_disease,
+        "Severity": severity,
+        "bucket_pct": bucket_pct,
+        "cat_data": scored["cat_data"]
+    }
+
+
+def get_triggered_categories_for_test(test_id: int):
+    rows = db.session.execute(
+        text("""
+                SELECT c.Category_Key, c.Category_Name, a.Answer_Value
+                FROM dbo.Student_Test_Answer a
+                JOIN dbo.Category_Gates g ON g.Gate_ID = a.Ref_ID
+                JOIN dbo.Categories c ON c.Category_ID = g.Category_ID
+                WHERE a.Test_ID = :tid
+                  AND a.Item_Type = 'Gate'
+            """),
+        {"tid": int(test_id)},
+    ).fetchall()
+
+    triggered_all = []
+    for ck, cn, val in rows:
+        val = int(val)
+        cn = cn or ""
+        short_name = cn.split(" (")[0].strip()
+
+        if ck == "SH":
+            if val >= 1:
+                triggered_all.append({
+                    "Category_Key": ck,
+                    "Category_Name": cn,
+                    "Category_Short_Name": short_name,
+                    "Gate_Score": val,
+                })
+        else:
+            if val >= 3:
+                triggered_all.append({
+                    "Category_Key": ck,
+                    "Category_Name": cn,
+                    "Category_Short_Name": short_name,
+                    "Gate_Score": val,
+                })
+
+    return triggered_all
+
+
+def map_profile_context(student_id: int):
+    gender = (get_profile_value(student_id, "gender") or "Unknown").strip()
+    live_with_family = (get_profile_value(student_id, "live_with_family") or "Unknown").strip()
+    family_income_bucket = (get_profile_value(student_id, "family_income_bucket") or "Unknown").strip()
+
+    living_situation = "With Family" if live_with_family.lower() == "yes" else (
+        "Away From Family" if live_with_family.lower() == "no" else "Unknown"
+    )
+
+    if family_income_bucket in ["0-50k", "50k-100k"]:
+        income_context = "Financial Pressure Possible"
+    elif family_income_bucket in ["100k-200k", "200k+"]:
+        income_context = "Stable Income Context"
+    else:
+        income_context = "Income Unknown"
+
+    return {
+        "gender": gender,
+        "living_situation": living_situation,
+        "income_context": income_context,
+        "live_with_family_raw": live_with_family,
+        "family_income_bucket_raw": family_income_bucket,
+    }
+
+
+def is_emergency_case(summary):
+    triggered_all = summary["triggered_all"]
+    dominant = (summary["Dominant_Disease"] or "").lower()
+    severity = (summary["Severity"] or "").lower()
+
+    if any(x["Category_Key"] == "SH" for x in triggered_all):
+        return True
+
+    if severity == "high" and dominant in ["depression", "anxiety"]:
+        return True
+
+    return False
+
+
+def safe_fetch_emergency_protocols():
+    """
+    Defensive fetch. Works if table exists with discussed columns.
+    If table doesn't exist or differs, fallback to default hardcoded guidance.
+    """
+    try:
+        rows = db.session.execute(
+            text("""
+                    SELECT
+                        Protocol_ID,
+                        Protocol_Name,
+                        Protocol_Type,
+                        Priority,
+                        Action_Text,
+                        Contact_Number,
+                        Contact_Name,
+                        Location,
+                        Required_Documentation,
+                        Operating_Hours,
+                        Resource_Link
+                    FROM dbo.Emergency_Protocols
+                    WHERE Is_Active = 1
+                    ORDER BY Priority ASC, Protocol_ID ASC
+                """)
+        ).fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "Protocol_ID": int(r[0]) if r[0] is not None else None,
+                "Protocol_Name": r[1],
+                "Protocol_Type": r[2],
+                "Priority": int(r[3]) if r[3] is not None else None,
+                "Action_Text": r[4],
+                "Contact_Number": r[5],
+                "Contact_Name": r[6],
+                "Location": r[7],
+                "Required_Documentation": r[8],
+                "Operating_Hours": r[9],
+                "Resource_Link": r[10],
+            })
+
+        if data:
+            return data
+    except Exception as e:
+        print("Emergency protocol table fetch failed:", e)
+
+    return [
+        {
+            "Protocol_Name": "Contact Emergency Support Immediately",
+            "Protocol_Type": "contact",
+            "Priority": 1,
+            "Action_Text": "Please contact a trusted family member, advisor, counselor, or emergency support service immediately.",
+            "Contact_Number": "",
+            "Contact_Name": "Trusted Contact / Emergency Service",
+            "Location": "",
+            "Required_Documentation": "",
+            "Operating_Hours": "Immediate",
+            "Resource_Link": "",
+        },
+        {
+            "Protocol_Name": "Do Not Stay Alone",
+            "Protocol_Type": "safety",
+            "Priority": 2,
+            "Action_Text": "Move to a safe place and stay with a trusted person until support is arranged.",
+            "Contact_Number": "",
+            "Contact_Name": "",
+            "Location": "",
+            "Required_Documentation": "",
+            "Operating_Hours": "Now",
+            "Resource_Link": "",
+        },
+    ]
+
+
+def safe_fetch_remedies(summary, student_context, max_duration=30):
+    """
+    Fetches actual remedies directly from the SQL database.
+    Limits to exactly 4 remedies per request to prevent overwhelm,
+    and randomizes them so the student sees fresh options each day.
+    """
+    dominant = summary["Dominant_Disease"]
+    severity = summary["Severity"].lower()
+
+    try:
+        # Added 'TOP 4' to strictly limit the amount shown
+        sql = text("""
+                SELECT TOP 4
+                    Remedy_ID,
+                    Title,
+                    Description,
+                    Remedy_Type,
+                    Duration_Minutes,
+                    Target_Severity,
+                    Resource_Link,
+                    Linked_Sub_Category_ID
+                FROM dbo.Remedy_Library
+                WHERE Is_Active = 1
+                  AND (
+                        Target_Disease IS NULL
+                        OR Target_Disease = :dom
+                        OR Target_Disease = 'General Wellness'
+                      )
+                  AND (
+                        Target_Severity IS NULL
+                        OR LOWER(Target_Severity) = :sev
+                        OR LOWER(Target_Severity) = 'all'
+                      )
+                  AND (
+                        Duration_Minutes IS NULL
+                        OR Duration_Minutes <= :maxd
+                        OR :maxd >= 999
+                      )
+                ORDER BY
+                    -- Priority 1: Match their exact disease first
+                    CASE
+                        WHEN Target_Disease = :dom THEN 0
+                        WHEN Target_Disease = 'General Wellness' THEN 1
+                        ELSE 2
+                    END,
+                    -- Priority 2: Randomize the results so they get a fresh 4 every day!
+                    NEWID()
+            """)
+
+        rows = db.session.execute(
+            sql,
+            {
+                "dom": dominant,
+                "sev": severity,
+                "maxd": int(max_duration),
+            },
+        ).fetchall()
+
+        remedies = []
+        for r in rows:
+            remedies.append({
+                "Remedy_ID": int(r[0]),
+                "Title": r[1],
+                "Description": r[2],
+                "Remedy_Type": r[3] or "General",
+                "Duration_Minutes": int(r[4]) if r[4] is not None else 10,
+                "Target_Severity": r[5],
+                "Resource_Link": r[6],
+                "Linked_Sub_Category_ID": r[7],
+            })
+
+        return remedies
+
+    except Exception as e:
+        print("Remedy library fetch failed:", e)
+        # Return empty list safely. NEVER return fake IDs.
+        return []
+
+
+def group_remedies_by_duration(remedies):
+    grouped = {
+        "immediate_0_5_min": [],
+        "quick_6_15_min": [],
+        "standard_16_30_min": [],
+        "extended_30_plus": [],
+    }
+
+    for r in remedies:
+        mins = int(r.get("Duration_Minutes") or 0)
+        if mins <= 5:
+            grouped["immediate_0_5_min"].append(r)
+        elif mins <= 15:
+            grouped["quick_6_15_min"].append(r)
+        elif mins <= 30:
+            grouped["standard_16_30_min"].append(r)
+        else:
+            grouped["extended_30_plus"].append(r)
+
+    return grouped
+
+
+def build_modality_distribution(remedies):
+    out = {}
+    for r in remedies:
+        rtype = r.get("Remedy_Type") or "General"
+        out[rtype] = out.get(rtype, 0) + 1
+    return out
+
+
+def build_rules_applied(summary, profile_ctx, remedies):
+    rules = []
+
+    rules.append(f"Used dominant disease: {summary['Dominant_Disease']}")
+    rules.append(f"Used severity level: {summary['Severity']}")
+
+    if summary["triggered_all"]:
+        keys = ", ".join(x["Category_Key"] for x in summary["triggered_all"])
+        rules.append(f"Triggered categories considered: {keys}")
+
+    if profile_ctx["gender"] != "Unknown":
+        rules.append(f"Profile applied: gender = {profile_ctx['gender']}")
+
+    if profile_ctx["living_situation"] != "Unknown":
+        rules.append(f"Profile applied: living situation = {profile_ctx['living_situation']}")
+
+    if profile_ctx["income_context"] != "Income Unknown":
+        rules.append(f"Profile applied: income context = {profile_ctx['income_context']}")
+
+    if remedies:
+        rules.append(f"Filtered and grouped {len(remedies)} remedy recommendations")
+
+    return rules
+
+
+def try_insert_remedy_history(student_id, test_id, remedy_id, status, rating=None, feedback_text=None):
+    """
+    Defensive insert. If table/columns differ, it won't crash the whole API.
+    """
+    try:
+        db.session.execute(
+            text("""
+                    INSERT INTO dbo.Student_Remedy_History
+                    (Student_ID, Test_ID, Remedy_ID, Status, Rating, Feedback_Text, Created_On)
+                    VALUES (:sid, :tid, :rid, :st, :rt, :ft, SYSUTCDATETIME())
+                """),
+            {
+                "sid": student_id,
+                "tid": test_id,
+                "rid": remedy_id,
+                "st": status,
+                "rt": rating,
+                "ft": feedback_text,
+            },
+        )
+        return True
+    except Exception as e:
+        print("Student_Remedy_History insert failed:", e)
+        return False
+
+
+# ==========================================
+# SIGNUP ENDPOINT
+# ==========================================
+@app.post("/api/signup")
+def student_signup():
+    """Handles new student registration"""
+    data = request.get_json()
+
+    name = data.get("name")
+    email = data.get("email")
+    gender = data.get("gender")
+    arid_no = data.get("arid_no")
+    semester = data.get("semester")
+    password = data.get("password")
+
+    if not all([name, email, gender, arid_no, semester, password]):
+        return jsonify({"ok": False, "message": "All fields are required"}), 400
+
+    try:
+        # 1. Check if ARID No or Email already exists
+        existing = db.session.execute(
+            text("SELECT 1 FROM dbo.Students WHERE Arid_No = :arid OR Email = :email"),
+            {"arid": arid_no, "email": email}
+        ).fetchone()
+
+        if existing:
+            return jsonify({"ok": False, "message": "A student with this ARID number or Email already exists!"}), 400
+
+        # 2. Automatically assign them to an Advisor (picks a random active advisor)
+        advisor = db.session.execute(text("SELECT TOP 1 Advisor_ID FROM dbo.Advisors ORDER BY NEWID()")).fetchone()
+        adv_id = advisor[0] if advisor else None
+
+        # 3. Save the new student
+        db.session.execute(
+            text("""
+                INSERT INTO dbo.Students (Arid_No, Student_Name, Email, Gender, Semester, Password, Advisor_ID)
+                VALUES (:arid, :name, :email, :gender, :semester, :pass, :adv_id)
+            """),
+            {
+                "arid": arid_no,
+                "name": name,
+                "email": email,
+                "gender": gender,
+                "semester": semester,
+                "pass": password,
+                "adv_id": adv_id
+            }
+        )
+        db.session.commit()
+
+        return jsonify({"ok": True, "message": "Account created successfully! You can now log in."})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Signup error: {e}")
+        return jsonify({"ok": False, "message": "Server error during signup."}), 500
+
+
+# -------------------------
+# AUTH & PROFILE
+# -------------------------
+@app.post("/api/login")
+def login():
+    """Handles login for Students, Advisors, and Psychologists"""
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"ok": False, "message": "No data provided"}), 400
+
+    # Safely grab the input whether the frontend calls it 'login_id' or 'arid_no'
+    login_input = data.get("login_id") or data.get("arid_no")
+    password_input = data.get("password")
+
+    if not login_input or not password_input:
+        return jsonify({"ok": False, "message": "Missing credentials"}), 400
+
+    try:
+        # 1. STUDENT CHECK
+        student = db.session.execute(
+            text(
+                "SELECT Student_ID, Student_Name, Arid_No FROM dbo.Students WHERE Arid_No = :arid AND Password = :pass"),
+            {"arid": login_input, "pass": password_input}
+        ).fetchone()
+
+        if student:
+            return jsonify({"ok": True, "role": "student", "student_id": student[0], "name": student[1],
+                            "arid_no": student[2]}), 200
+
+        # 2. ADVISOR CHECK
+        advisor = db.session.execute(
+            text("SELECT Advisor_ID, Advisor_Name FROM dbo.Advisors WHERE Advisor_Code = :code AND Password = :pass"),
+            {"code": login_input, "pass": password_input}
+        ).fetchone()
+
+        if advisor:
+            return jsonify({"ok": True, "role": "advisor", "advisor_id": advisor[0], "name": advisor[1]}), 200
+
+        # 3. PSYCHOLOGIST CHECK
+        psychologist = db.session.execute(
+            text(
+                "SELECT Psychologist_ID, Name FROM dbo.Psychologists WHERE Psychologist_Code = :code AND Password = :pass"),
+            {"code": login_input, "pass": password_input}
+        ).fetchone()
+
+        if psychologist:
+            return jsonify(
+                {"ok": True, "role": "psychologist", "psychologist_id": psychologist[0], "name": psychologist[1]}), 200
+
+        # 4. ADMIN CHECK
+        admin = db.session.execute(
+            text("SELECT Admin_ID, Name FROM dbo.Admins WHERE Admin_Code = :code AND Password = :pass"),
+            {"code": login_input, "pass": password_input}
+        ).fetchone()
+
+        if admin:
+            return jsonify({"ok": True, "role": "admin", "admin_id": admin[0], "name": admin[1]}), 200
+
+        # 5. NO MATCH FOUND
+        return jsonify({"ok": False, "message": "Invalid Login ID or Password"}), 401
+
+    except Exception as e:
+        print(f"Login error: {e}")
+        return jsonify({"ok": False, "message": "Server error during login"}), 500
+
+
+# ==========================================
+# ADVISOR - STUDENT MEETING HANDSHAKE
+# ==========================================
+
+@app.get("/api/advisor/alerts-and-meetings")
+def get_advisor_alerts():
+    """Fetches new high-alert students needing meetings, and students who accepted meetings"""
+    adv_id = request.args.get("advisor_id")
+    if not adv_id: return jsonify({"ok": False}), 400
+
+    try:
+        # 1. New Alerts: High severity students who do NOT have an active referral OR active advisor meeting
+        new_alerts = db.session.execute(text("""
+            SELECT DISTINCT s.Student_ID, s.Student_Name, s.Arid_No
+            FROM dbo.Students s
+            WHERE s.Advisor_ID = :aid AND (
+                EXISTS (SELECT 1 FROM dbo.General_Test_Result g WHERE g.Student_ID = s.Student_ID AND (g.Severity_Label LIKE '%High%' OR g.Severity_Label LIKE '%Severe%'))
+                OR EXISTS (SELECT 1 FROM dbo.Weekly_CheckIn_Session w WHERE w.Student_ID = s.Student_ID AND (w.Triggered_Disease LIKE '%SH%' OR w.Triggered_Category_Key LIKE '%SH%' OR w.Total_Score >= 15))
+                OR EXISTS (
+                    SELECT 1 FROM dbo.Test_Session ts
+                    JOIN dbo.Student_Test_Answer sta ON sta.Test_ID = ts.Test_ID
+                    JOIN dbo.Category_Gates cg ON cg.Gate_ID = sta.Ref_ID
+                    JOIN dbo.Categories c ON c.Category_ID = cg.Category_ID
+                    WHERE ts.Student_ID = s.Student_ID AND sta.Item_Type = 'Gate' AND c.Category_Key = 'SH' AND sta.Answer_Value >= 1
+                )
+            )
+            AND NOT EXISTS (SELECT 1 FROM dbo.Student_Referrals sr WHERE sr.Student_ID = s.Student_ID AND sr.Status != 'Completed')
+            AND NOT EXISTS (SELECT 1 FROM dbo.Advisor_Student_Meetings am WHERE am.Student_ID = s.Student_ID AND am.Status IN ('Proposed', 'Accepted'))
+        """), {"aid": adv_id}).fetchall()
+
+        alerts_list = [{"id": r[0], "name": r[1], "arid": r[2]} for r in new_alerts]
+
+        # 2. Accepted Meetings: Students who chose a slot
+        accepted = db.session.execute(text("""
+            SELECT m.Meeting_ID, s.Student_Name, s.Arid_No, m.Confirmed_Slot
+            FROM dbo.Advisor_Student_Meetings m
+            JOIN dbo.Students s ON m.Student_ID = s.Student_ID
+            WHERE m.Advisor_ID = :aid AND m.Status = 'Accepted'
+        """), {"aid": adv_id}).fetchall()
+
+        accepted_list = [{"meeting_id": r[0], "name": r[1], "arid": r[2], "slot": r[3]} for r in accepted]
+
+        return jsonify({"ok": True, "new_alerts": alerts_list, "accepted_meetings": accepted_list})
+    except Exception as e:
+        print("Alerts fetch error:", e)
+        return jsonify({"ok": False}), 500
+
+
+@app.post("/api/advisor/propose-meeting")
+def propose_advisor_meeting():
+    """Advisor sends free slots to the student"""
+    data = request.json
+    try:
+        student = db.session.execute(text("SELECT Student_ID FROM dbo.Students WHERE Arid_No = :arid"),
+                                     {"arid": data.get("arid_no")}).fetchone()
+        db.session.execute(text("""
+            INSERT INTO dbo.Advisor_Student_Meetings (Student_ID, Advisor_ID, Proposed_Slots, Status)
+            VALUES (:sid, :aid, :slots, 'Proposed')
+        """), {"sid": student[0], "aid": data.get("advisor_id"), "slots": data.get("slots")})
+        db.session.commit()
+        return jsonify({"ok": True})
+    except:
+        db.session.rollback()
+        return jsonify({"ok": False}), 500
+
+
+@app.post("/api/advisor/mark-meeting-complete")
+def mark_adv_meeting_complete():
+    """Advisor clears the notification after the meeting happens"""
+    try:
+        db.session.execute(text("UPDATE dbo.Advisor_Student_Meetings SET Status = 'Completed' WHERE Meeting_ID = :mid"),
+                           {"mid": request.json.get("meeting_id")})
+        db.session.commit()
+        return jsonify({"ok": True})
+    except:
+        db.session.rollback()
+        return jsonify({"ok": False}), 500
+
+
+@app.get("/api/student/advisor-meeting-status")
+def student_advisor_meeting_status():
+    """Checks if an advisor requested a meeting with the student"""
+    try:
+        student = db.session.execute(text("SELECT Student_ID FROM dbo.Students WHERE Arid_No = :arid"),
+                                     {"arid": request.args.get("arid_no")}).fetchone()
+        meeting = db.session.execute(text("""
+            SELECT Meeting_ID, Proposed_Slots, Status, Confirmed_Slot
+            FROM dbo.Advisor_Student_Meetings
+            WHERE Student_ID = :sid AND Status IN ('Proposed', 'Accepted')
+        """), {"sid": student[0]}).fetchone()
+
+        if meeting:
+            return jsonify(
+                {"ok": True, "has_meeting": True, "meeting_id": meeting[0], "slots": meeting[1], "status": meeting[2],
+                 "confirmed_slot": meeting[3]})
+        return jsonify({"ok": True, "has_meeting": False})
+    except:
+        return jsonify({"ok": False}), 500
+
+
+@app.post("/api/student/accept-advisor-meeting")
+def accept_advisor_meeting():
+    """Student accepts a slot, notifying the advisor"""
+    data = request.json
+    try:
+        db.session.execute(text(
+            "UPDATE dbo.Advisor_Student_Meetings SET Status = 'Accepted', Confirmed_Slot = :slot WHERE Meeting_ID = :mid"),
+                           {"slot": data.get("slot"), "mid": data.get("meeting_id")})
+        db.session.commit()
+        return jsonify({"ok": True})
+    except:
+        db.session.rollback()
+        return jsonify({"ok": False}), 500
+
+
+# ==========================================
+# ADMIN CRUD ENDPOINTS (Students, Advisors, Psychologists)
+# ==========================================
+
+# --- ADVISORS ---
+@app.route("/api/admin/advisors", methods=["GET", "POST", "PUT", "DELETE"])
+def admin_advisors():
+    if request.method == "GET":
+        rows = db.session.execute(text(
+            "SELECT Advisor_ID, Advisor_Name, Email, Department, Advisor_Code, Password FROM dbo.Advisors")).fetchall()
+        data = [{"Advisor_ID": r[0], "Advisor_Name": r[1], "Email": r[2], "Department": r[3], "Advisor_Code": r[4],
+                 "Password": r[5]} for r in rows]
+        return jsonify({"ok": True, "data": data})
+
+    elif request.method == "POST":
+        data = request.json
+        code = data.get("Advisor_Code") or f"ADV-{random.randint(100, 999)}"
+        try:
+            db.session.execute(
+                text(
+                    "INSERT INTO dbo.Advisors (Advisor_Name, Email, Department, Advisor_Code, Password) VALUES (:name, :email, :dept, :code, :pass)"),
+                {"name": data.get("Advisor_Name"), "email": data.get("Email"), "dept": data.get("Department"),
+                 "code": code, "pass": data.get("Password")}
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Advisor added successfully!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "PUT":
+        data = request.json
+        try:
+            db.session.execute(
+                text(
+                    "UPDATE dbo.Advisors SET Advisor_Name=:name, Email=:email, Department=:dept, Advisor_Code=:code, Password=:pass WHERE Advisor_ID=:id"),
+                {"name": data.get("Advisor_Name"), "email": data.get("Email"), "dept": data.get("Department"),
+                 "code": data.get("Advisor_Code"), "pass": data.get("Password"), "id": data.get("Advisor_ID")}
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Advisor updated successfully!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "DELETE":
+        try:
+            db.session.execute(text("DELETE FROM dbo.Advisors WHERE Advisor_ID=:id"), {"id": request.json.get("id")})
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Advisor deleted!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify(
+                {"ok": False, "message": "Cannot delete: This advisor has linked students or referrals."}), 400
+
+
+# --- PSYCHOLOGISTS ---
+@app.route("/api/admin/psychologists", methods=["GET", "POST", "PUT", "DELETE"])
+def admin_psychologists():
+    if request.method == "GET":
+        rows = db.session.execute(text(
+            "SELECT Psychologist_ID, Psychologist_Code, Name, Credentials, Available_Day, Email, Password FROM dbo.Psychologists")).fetchall()
+        data = [{"Psychologist_ID": r[0], "Psychologist_Code": r[1], "Name": r[2], "Credentials": r[3],
+                 "Available_Day": r[4], "Email": r[5], "Password": r[6]} for r in rows]
+        return jsonify({"ok": True, "data": data})
+
+    elif request.method == "POST":
+        data = request.json
+        code = data.get("Psychologist_Code") or f"PSY-{random.randint(100, 999)}"
+        try:
+            db.session.execute(
+                text(
+                    "INSERT INTO dbo.Psychologists (Psychologist_Code, Name, Credentials, Available_Day, Email, Password) VALUES (:code, :name, :cred, :day, :email, :pass)"),
+                {"code": code, "name": data.get("Name"), "cred": data.get("Credentials"),
+                 "day": data.get("Available_Day"), "email": data.get("Email"), "pass": data.get("Password")}
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Psychologist added successfully!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "PUT":
+        data = request.json
+        try:
+            db.session.execute(
+                text(
+                    "UPDATE dbo.Psychologists SET Psychologist_Code=:code, Name=:name, Credentials=:cred, Available_Day=:day, Email=:email, Password=:pass WHERE Psychologist_ID=:id"),
+                {"code": data.get("Psychologist_Code"), "name": data.get("Name"), "cred": data.get("Credentials"),
+                 "day": data.get("Available_Day"), "email": data.get("Email"), "pass": data.get("Password"),
+                 "id": data.get("Psychologist_ID")}
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Psychologist updated successfully!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "DELETE":
+        try:
+            db.session.execute(text("DELETE FROM dbo.Psychologists WHERE Psychologist_ID=:id"),
+                               {"id": request.json.get("id")})
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Psychologist deleted!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": "Cannot delete: This psychologist has linked appointments."}), 400
+
+
+# --- STUDENTS ---
+@app.route("/api/admin/students", methods=["GET", "POST", "PUT", "DELETE"])
+def admin_students():
+    if request.method == "GET":
+        rows = db.session.execute(text("""
+            SELECT Student_ID, Arid_No, Student_Name, First_Name, Last_Name, Email, Department, 
+                   Admission_Session, Semester, CGPA, Gender, Age, Advisor_ID, Password 
+            FROM dbo.Students
+        """)).fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "Student_ID": r[0], "Arid_No": r[1], "Student_Name": r[2], "First_Name": r[3],
+                "Last_Name": r[4], "Email": r[5], "Department": r[6], "Admission_Session": r[7],
+                "Semester": r[8], "CGPA": str(r[9]) if r[9] else "", "Gender": r[10],
+                "Age": r[11], "Advisor_ID": r[12], "Password": r[13]
+            })
+        return jsonify({"ok": True, "data": data})
+
+    elif request.method == "POST":
+        d = request.json
+        try:
+            db.session.execute(
+                text("""
+                    INSERT INTO dbo.Students 
+                    (Arid_No, Student_Name, First_Name, Last_Name, Email, Department, Admission_Session, Semester, CGPA, Gender, Age, Advisor_ID, Password) 
+                    VALUES (:arid, :name, :fname, :lname, :email, :dept, :sess, :sem, :cgpa, :gen, :age, :adv, :pass)
+                """),
+                {
+                    "arid": d.get("Arid_No"), "name": d.get("Student_Name"), "fname": d.get("First_Name"),
+                    "lname": d.get("Last_Name"),
+                    "email": d.get("Email"), "dept": d.get("Department"), "sess": d.get("Admission_Session"),
+                    "sem": d.get("Semester"),
+                    "cgpa": d.get("CGPA") or None, "gen": d.get("Gender"), "age": d.get("Age") or None,
+                    "adv": d.get("Advisor_ID") or None, "pass": d.get("Password")
+                }
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Student added successfully!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "PUT":
+        d = request.json
+        try:
+            db.session.execute(
+                text("""
+                    UPDATE dbo.Students 
+                    SET Arid_No=:arid, Student_Name=:name, First_Name=:fname, Last_Name=:lname, Email=:email, 
+                        Department=:dept, Admission_Session=:sess, Semester=:sem, CGPA=:cgpa, Gender=:gen, 
+                        Age=:age, Advisor_ID=:adv, Password=:pass 
+                    WHERE Student_ID=:id
+                """),
+                {
+                    "arid": d.get("Arid_No"), "name": d.get("Student_Name"), "fname": d.get("First_Name"),
+                    "lname": d.get("Last_Name"),
+                    "email": d.get("Email"), "dept": d.get("Department"), "sess": d.get("Admission_Session"),
+                    "sem": d.get("Semester"),
+                    "cgpa": d.get("CGPA") or None, "gen": d.get("Gender"), "age": d.get("Age") or None,
+                    "adv": d.get("Advisor_ID") or None, "pass": d.get("Password"),
+                    "id": d.get("Student_ID")
+                }
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Student updated successfully!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "DELETE":
+        try:
+            db.session.execute(text("DELETE FROM dbo.Students WHERE Student_ID=:id"), {"id": request.json.get("id")})
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Student deleted!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": "Cannot delete: Student has test history or profiles linked."}), 400
+
+
+@app.get("/api/check-profile-status/<arid_no>")
+def check_profile_status(arid_no):
+    sid = get_student_id_by_arid(arid_no)
+    if not sid:
+        return jsonify({"ok": False, "message": "Student not found"}), 404
+
+    total = db.session.execute(
+        text("SELECT COUNT(*) FROM dbo.Profile_Questions WHERE Is_Active = 1")
+    ).scalar() or 0
+
+    answered = db.session.execute(
+        text("""
+                SELECT COUNT(*)
+                FROM dbo.Student_Profile_Response spr
+                JOIN dbo.Profile_Questions pq
+                    ON pq.Profile_Question_ID = spr.Profile_Question_ID
+                WHERE spr.Student_ID = :sid
+                  AND pq.Is_Active = 1
+            """),
+        {"sid": sid},
+    ).scalar() or 0
+
+    return jsonify({
+        "ok": True,
+        "isComplete": int(answered) >= int(total) and total > 0,
+        "answered": int(answered),
+        "total": int(total),
+    })
+
+
+@app.get("/api/profile-questions")
+def profile_questions():
+    try:
+        rows = db.session.execute(
+            text("""
+                    SELECT Profile_Question_ID, Feature_Key, Question_Text, Input_Type, Options_JSON
+                    FROM dbo.Profile_Questions
+                    WHERE Is_Active = 1
+                    ORDER BY Sort_Order ASC, Profile_Question_ID ASC
+                """)
+        ).fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "id": int(r[0]),
+                "target_key": r[1],
+                "text": r[2],
+                "type": r[3],
+                "options": _parse_options_json(r[4]),
+            })
+
+        return jsonify(data)
+    except Exception as e:
+        print(f"Error in profile_questions: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.post("/api/save-profile")
+def save_profile():
+    data = request.get_json(force=True) or {}
+    arid_no = (data.get("Arid_No") or "").strip()
+    responses = data.get("responses") or []
+
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing Arid_No"}), 400
+
+    sid = get_student_id_by_arid(arid_no)
+    if not sid:
+        return jsonify({"ok": False, "message": "Student not found"}), 404
+
+    try:
+        for item in responses:
+            qid = item.get("question_id")
+            ans = item.get("answer")
+            if qid is None:
+                continue
+
+            db.session.execute(
+                text("""
+                        MERGE dbo.Student_Profile_Response AS target
+                        USING (VALUES (:sid, :qid, :ans))
+                              AS source (Student_ID, Profile_Question_ID, Response_Value)
+                        ON target.Student_ID = source.Student_ID
+                           AND target.Profile_Question_ID = source.Profile_Question_ID
+                        WHEN MATCHED THEN
+                            UPDATE SET
+                                Response_Value = source.Response_Value,
+                                Created_On = SYSUTCDATETIME()
+                        WHEN NOT MATCHED THEN
+                            INSERT (Student_ID, Profile_Question_ID, Response_Value)
+                            VALUES (source.Student_ID, source.Profile_Question_ID, source.Response_Value);
+                    """),
+                {"sid": sid, "qid": int(qid), "ans": str(ans) if ans is not None else None},
+            )
+
+        db.session.commit()
+        return jsonify({"ok": True, "message": "Profile saved successfully"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.get("/api/student-id")
+def student_id_endpoint():
+    arid_no = (request.args.get("arid_no") or "").strip()
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    sid = get_student_id_by_arid(arid_no)
+    if not sid:
+        return jsonify({"ok": False, "message": "Student not found"}), 404
+
+    return jsonify({"ok": True, "student_id": sid})
+
+
+@app.get("/api/category-gates")
+def category_gates():
+    arid_no = (request.args.get("arid_no") or "").strip()
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    sid = get_student_id_by_arid(arid_no)
+    if not sid:
+        return jsonify({"ok": False, "message": "Student not found"}), 404
+
+    live_with_family = (get_profile_value(sid, "live_with_family") or "").strip()
+    mother_status = (get_profile_value(sid, "mother_status") or "").strip()
+    father_status = (get_profile_value(sid, "father_status") or "").strip()
+
+    allow_ct = (live_with_family.lower() == "yes")
+    allow_fd = (mother_status.lower() == "alive") or (father_status.lower() == "alive")
+
+    rows = db.session.execute(
+        text("""
+                SELECT g.Gate_ID, c.Category_Key, c.Category_Name, g.Gate_Text, g.Sort_Order
+                FROM dbo.Category_Gates g
+                JOIN dbo.Categories c ON c.Category_ID = g.Category_ID
+                WHERE g.Is_Active = 1
+                  AND c.Is_Active = 1
+                ORDER BY g.Sort_Order ASC
+            """)
+    ).fetchall()
+
+    filtered = []
+    for r in rows:
+        gate_id = int(r[0])
+        cat_key = r[1]
+        if cat_key == "CT" and not allow_ct:
+            continue
+        if cat_key == "FD" and not allow_fd:
+            continue
+
+        filtered.append({
+            "id": gate_id,
+            "category_key": cat_key,
+            "category_name": r[2],
+            "text": r[3],
+        })
+
+    return jsonify(filtered)
+
+
+# ==========================================
+# MEETING NOTIFICATION ENDPOINTS
+# ==========================================
+
+# ==========================================
+# ALL MEETING NOTIFICATION ENDPOINTS
+# ==========================================
+
+@app.get("/api/student/meeting-status")
+def student_meeting_status():
+    arid_no = request.args.get("arid_no")
+    if not arid_no: return jsonify({"ok": False}), 400
+
+    try:
+        student = db.session.execute(text("SELECT Student_ID FROM dbo.Students WHERE Arid_No = :arid"),
+                                     {"arid": arid_no}).fetchone()
+        if not student: return jsonify({"ok": False}), 404
+
+        meeting = db.session.execute(
+            text(
+                "SELECT Status, Meeting_Date FROM dbo.Psychologist_Meetings WHERE Student_ID = :sid ORDER BY Requested_On DESC"),
+            {"sid": student[0]}
+        ).fetchone()
+
+        referred = db.session.execute(
+            text("SELECT 1 FROM dbo.Student_Referrals WHERE Student_ID = :sid AND Status = 'Pending'"),
+            {"sid": student[0]}
+        ).fetchone()
+
+        needs_meeting = False
+        already_requested = False
+        is_scheduled = False
+        meeting_date_str = None
+
+        if meeting:
+            # 🔥 BULLETPROOF FIX: .strip() removes invisible spaces from SQL
+            status_text = meeting[0].strip() if meeting[0] else ""
+
+            if status_text == 'Requested':
+                already_requested = True
+            elif status_text == 'Scheduled':
+                is_scheduled = True
+                if meeting[1]:
+                    d = meeting[1]
+                    meeting_date_str = d.strftime('%b %d, %Y - %I:%M %p') if hasattr(d, 'strftime') else str(d)
+
+        if referred and not already_requested and not is_scheduled:
+            needs_meeting = True
+
+        return jsonify({
+            "ok": True,
+            "needs_meeting": needs_meeting,
+            "already_requested": already_requested,
+            "is_scheduled": is_scheduled,
+            "meeting_date": meeting_date_str
+        })
+    except Exception as e:
+        print(f"Student meeting status error: {e}")
+        return jsonify({"ok": False}), 500
+
+
+@app.post("/api/student/request-meeting")
+def student_request_meeting():
+    data = request.get_json()
+    arid_no = data.get("arid_no")
+    try:
+        student = db.session.execute(text("SELECT Student_ID FROM dbo.Students WHERE Arid_No = :arid"),
+                                     {"arid": arid_no}).fetchone()
+        db.session.execute(text(
+            "UPDATE dbo.Student_Referrals SET Status = 'Meeting_Requested' WHERE Student_ID = :sid AND Status = 'Pending'"),
+            {"sid": student[0]})
+        db.session.execute(text("INSERT INTO dbo.Psychologist_Meetings (Student_ID) VALUES (:sid)"),
+                           {"sid": student[0]})
+        db.session.commit()
+        return jsonify({"ok": True})
+    except:
+        db.session.rollback()
+        return jsonify({"ok": False}), 500
+
+
+@app.get("/api/psychologist/meeting-alerts")
+def psy_meeting_alerts():
+    try:
+        count = db.session.execute(
+            text("SELECT COUNT(*) FROM dbo.Psychologist_Meetings WHERE Status = 'Requested'")).scalar()
+        return jsonify({"ok": True, "new_requests": count})
+    except:
+        return jsonify({"ok": False}), 500
+
+
+@app.get("/api/psychologist/meetings-list")
+def get_psy_meetings_list():
+    try:
+        meetings = db.session.execute(
+            text("""
+                SELECT m.Meeting_ID, s.Student_Name, s.Arid_No, m.Requested_On, m.Status, m.Meeting_Date, m.Notes, m.Remarks
+                FROM dbo.Psychologist_Meetings m
+                INNER JOIN dbo.Students s ON m.Student_ID = s.Student_ID
+                WHERE m.Status IN ('Requested', 'Scheduled')
+                ORDER BY m.Requested_On DESC
+            """)
+        ).fetchall()
+
+        results = []
+        for r in meetings:
+            d = r[3]
+            date_str = d.strftime('%b %d, %Y - %I:%M %p') if hasattr(d, 'strftime') else str(d)
+            sched_date = r[5]
+            sched_str = sched_date.strftime('%Y-%m-%dT%H:%M') if hasattr(sched_date, 'strftime') else (
+                str(sched_date) if sched_date else None)
+            results.append({
+                "id": r[0],
+                "name": r[1],
+                "arid": r[2],
+                "date": date_str,
+                "status": r[4].strip() if r[4] else "Requested",
+                "scheduled_date": sched_str,
+                "notes": r[6] or "",
+                "remarks": r[7] or "" if len(r) > 7 else ""
+            })
+        return jsonify({"ok": True, "meetings": results})
+    except Exception as e:
+        print(f"Meetings list error: {e}")
+        return jsonify({"ok": False}), 500
+
+
+@app.post("/api/psychologist/schedule-meeting")
+def schedule_psy_meeting():
+    data = request.get_json()
+    meeting_id = data.get("meeting_id")
+    meeting_date = data.get("meeting_date")
+    notes = data.get("notes", "")
+    student_arid = data.get("student_arid")  # For new direct scheduling
+
+    try:
+        clean_date = meeting_date.replace('T', ' ') if meeting_date else None
+
+        if meeting_id:
+            # Existing flow: update requested meeting
+            db.session.execute(text(
+                "UPDATE dbo.Psychologist_Meetings SET Status = 'Scheduled', Meeting_Date = :mdate, Notes = :notes WHERE Meeting_ID = :mid"),
+                {"mdate": clean_date, "notes": notes, "mid": meeting_id}
+            )
+        elif student_arid:
+            # New direct scheduling flow
+            student = db.session.execute(
+                text("SELECT Student_ID FROM dbo.Students WHERE Arid_No = :arid"),
+                {"arid": student_arid}
+            ).fetchone()
+
+            if not student:
+                return jsonify({"ok": False, "message": "Student not found"}), 404
+
+            # Check for double-booking
+            existing = db.session.execute(
+                text("""
+                    SELECT COUNT(*) FROM dbo.Psychologist_Meetings 
+                    WHERE Status = 'Scheduled' 
+                    AND Meeting_Date IS NOT NULL
+                    AND ABS(DATEDIFF(MINUTE, Meeting_Date, :mdate)) < 60
+                """),
+                {"mdate": clean_date}
+            ).scalar()
+
+            if existing and existing > 0:
+                return jsonify(
+                    {"ok": False, "message": "This time slot is already booked. Please choose another."}), 409
+
+            db.session.execute(
+                text("""
+                    INSERT INTO dbo.Psychologist_Meetings (Student_ID, Status, Meeting_Date, Notes, Requested_On)
+                    VALUES (:sid, 'Scheduled', :mdate, :notes, SYSUTCDATETIME())
+                """),
+                {"sid": student[0], "mdate": clean_date, "notes": notes}
+            )
+        else:
+            return jsonify({"ok": False, "message": "Missing meeting_id or student_arid"}), 400
+
+        db.session.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Schedule meeting error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.get("/api/psychologist/booked-slots")
+def get_booked_slots():
+    """Returns all already scheduled meeting dates for conflict checking"""
+    try:
+        rows = db.session.execute(
+            text("""
+                SELECT Meeting_Date, Notes, s.Student_Name
+                FROM dbo.Psychologist_Meetings m
+                JOIN dbo.Students s ON m.Student_ID = s.Student_ID
+                WHERE m.Status = 'Scheduled' 
+                AND m.Meeting_Date IS NOT NULL
+                AND m.Meeting_Date >= CAST(GETDATE() AS DATE)
+                ORDER BY m.Meeting_Date ASC
+            """)
+        ).fetchall()
+
+        slots = []
+        for r in rows:
+            d = r[0]
+            slots.append({
+                "date": d.strftime('%Y-%m-%dT%H:%M') if hasattr(d, 'strftime') else str(d),
+                "student": r[2] or "Unknown",
+                "notes": r[1] or ""
+            })
+        return jsonify({"ok": True, "booked_slots": slots})
+    except Exception as e:
+        print(f"Booked slots error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.post("/api/psychologist/save-remarks")
+def save_psy_remarks():
+    data = request.get_json()
+    meeting_id = data.get("meeting_id")
+    remarks = data.get("remarks", "").strip()
+
+    if not meeting_id:
+        return jsonify({"ok": False, "message": "Missing meeting_id"}), 400
+    if not remarks:
+        return jsonify({"ok": False, "message": "Remarks cannot be empty"}), 400
+
+    try:
+        db.session.execute(
+            text("UPDATE dbo.Psychologist_Meetings SET Remarks = :remarks WHERE Meeting_ID = :mid"),
+            {"remarks": remarks, "mid": meeting_id}
+        )
+        db.session.commit()
+        return jsonify({"ok": True})
+    except Exception as e:
+        db.session.rollback()
+        print(f"Save remarks error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.get("/api/advisor/psychologist-remarks")
+def get_psy_remarks_for_advisor():
+    advisor_id = request.args.get("advisor_id")
+    if not advisor_id:
+        return jsonify({"ok": False, "message": "Missing advisor_id"}), 400
+
+    try:
+        rows = db.session.execute(
+            text("""
+                SELECT s.Student_Name, pm.Remarks, pm.Meeting_Date
+                FROM dbo.Psychologist_Meetings pm
+                INNER JOIN dbo.Students s ON pm.Student_ID = s.Student_ID
+                INNER JOIN dbo.Student_Referrals sr ON s.Student_ID = sr.Student_ID
+                WHERE sr.Advisor_ID = :adv_id
+                  AND pm.Status = 'Scheduled'
+                  AND pm.Remarks IS NOT NULL
+                  AND pm.Remarks <> ''
+                ORDER BY pm.Meeting_Date DESC
+            """),
+            {"adv_id": advisor_id}
+        ).fetchall()
+
+        remarks = []
+        for r in rows:
+            d = r[2]
+            remarks.append({
+                "student_name": r[0],
+                "remarks": r[1],
+                "meeting_date": d.strftime('%b %d, %Y') if hasattr(d, 'strftime') else str(d)
+            })
+        return jsonify({"ok": True, "remarks": remarks})
+    except Exception as e:
+        print(f"Advisor remarks fetch error: {e}")
+        return jsonify({"ok": False}), 500
+
+
+# ==========================================
+# ADD THIS ENDPOINT TO YOUR new_python.txt / Flask app
+# Place it near the other /api/advisor/ or /api/psychologist/ routes
+# ==========================================
+
+# ==========================================
+# REPLACE your existing /api/student/profile route with this
+# ==========================================
+
+@app.get("/api/student/profile")
+def get_student_profile():
+    """
+    Fetches full student profile data by arid_no.
+    Joins with Advisors table to resolve advisor_name from advisor_id.
+    Used by the 'View Profile' button on Advisor & Psychologist dashboards.
+    """
+    arid_no = request.args.get("arid_no")
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    try:
+        row = db.session.execute(
+            text("""
+                SELECT
+                    s.Student_ID,
+                    s.Arid_No,
+                    s.Student_Name,
+                    s.First_Name,
+                    s.Last_Name,
+                    s.Email,
+                    s.Gender,
+                    s.Age,
+                    s.DOB,
+                    s.Department,
+                    s.Semester,
+                    s.Current_Semester,
+                    s.Admission_Session,
+                    s.CGPA,
+                    s.Relationship_Status,
+                    s.Hobbies_Text,
+                    s.Family_Income,
+                    s.Mother_Status,
+                    s.Father_Status,
+                    s.Brother_Count,
+                    s.Sister_Count,
+                    s.Birth_Order,
+                    s.Living_Arrangement,
+                    s.Created_On,
+                    s.Advisor_ID,
+                    a.Advisor_Name
+                FROM dbo.Students s
+                LEFT JOIN dbo.Advisors a ON s.Advisor_ID = a.Advisor_ID
+                WHERE s.Arid_No = :arid
+            """),
+            {"arid": arid_no}
+        ).fetchone()
+
+        if not row:
+            return jsonify({"ok": False, "message": "Student not found"}), 404
+
+        profile = {
+            "student_id": row[0],
+            "arid_no": row[1],
+            "student_name": row[2],
+            "first_name": row[3],
+            "last_name": row[4],
+            "email": row[5],
+            "gender": row[6],
+            "age": row[7],
+            "dob": str(row[8]).split(" ")[0] if row[8] else None,
+            "department": row[9],
+            "semester": row[10],
+            "current_semester": row[11],
+            "admission_session": row[12],
+            "cgpa": str(row[13]) if row[13] is not None else None,
+            "relationship_status": row[14],
+            "hobbies_text": row[15],
+            "family_income": row[16],
+            "mother_status": row[17],
+            "father_status": row[18],
+            "brother_count": row[19],
+            "sister_count": row[20],
+            "birth_order": row[21],
+            "living_arrangement": row[22],
+            "created_on": row[23].strftime("%Y-%m-%d") if row[23] else None,
+            "advisor_id": row[24],
+            "advisor_name": row[25],
+        }
+
+        return jsonify({"ok": True, "profile": profile})
+
+    except Exception as e:
+        print(f"Student profile fetch error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.get("/api/psychologist/referred-students")
+def get_referred_students_for_scheduling():
+    psychologist_id = request.args.get("psychologist_id")
+
+    if not psychologist_id:
+        return jsonify({"ok": False, "message": "Missing psychologist_id"}), 400
+
+    try:
+        rows = db.session.execute(
+            text("""
+                SELECT DISTINCT
+                    s.Student_ID,
+                    s.Student_Name,
+                    s.Arid_No,
+                    MAX(sr.Referred_On) as last_referred
+                FROM dbo.Students s
+                INNER JOIN dbo.Student_Referrals sr
+                    ON s.Student_ID = sr.Student_ID
+                WHERE sr.Psychologist_ID = :pid
+                  AND sr.Status IN ('Pending', 'Meeting_Requested', 'Scheduled', 'Completed')
+                GROUP BY s.Student_ID, s.Student_Name, s.Arid_No
+                ORDER BY last_referred DESC
+            """),
+            {"pid": psychologist_id}
+        ).fetchall()
+
+        students = []
+        for r in rows:
+            students.append({
+                "id": r[0],
+                "name": r[1],
+                "arid": r[2],
+                "last_referred": r[3].isoformat() if hasattr(r[3], 'isoformat') else str(r[3])
+            })
+
+        return jsonify({"ok": True, "students": students})
+
+    except Exception as e:
+        print(f"Referred students error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+# SUBMIT GATES
+# -------------------------
+@app.post("/api/test/gates/submit")
+def submit_gates():
+    data = request.get_json(force=True) or {}
+    arid_no = (data.get("Arid_No") or "").strip()
+    responses = data.get("responses") or []
+
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing Arid_No"}), 400
+
+    sid = get_student_id_by_arid(arid_no)
+    if not sid:
+        return jsonify({"ok": False, "message": "Student not found"}), 404
+
+    test_id = db.session.execute(
+        text("""
+                INSERT INTO dbo.Test_Session (Student_ID, Status)
+                OUTPUT INSERTED.Test_ID
+                VALUES (:sid, 'Active')
+            """),
+        {"sid": sid},
+    ).scalar()
+
+    for item in responses:
+        gate_id = int(item.get("gate_id"))
+        score = int(item.get("score"))
+
+        db.session.execute(
+            text("""
+                    INSERT INTO dbo.Student_Test_Answer (Test_ID, Item_Type, Ref_ID, Answer_Value)
+                    VALUES (:tid, 'Gate', :rid, :val)
+                """),
+            {"tid": int(test_id), "rid": gate_id, "val": score},
+        )
+
+    summary = build_test_summary(int(test_id))
+    triggered_all = summary["triggered_all"]
+
+    for t in triggered_all:
+        cat_row = db.session.execute(
+            text("SELECT Category_ID FROM dbo.Categories WHERE Category_Key = :ck"),
+            {"ck": t["Category_Key"]},
+        ).fetchone()
+
+        if cat_row:
+            db.session.execute(
+                text("""
+                        INSERT INTO dbo.Test_Category_State
+                        (Test_ID, Category_ID, Gate_Answer, Current_Base_Order, Is_Completed)
+                        VALUES (:tid, :cid, 1, 0, 0)
+                    """),
+                {"tid": test_id, "cid": cat_row[0]},
+            )
+
+    db.session.commit()
+
+    return jsonify({
+        "ok": True,
+        "test_id": int(test_id),
+        "triggered_categories": summary["triggered_categories"],
+        "triggered_count": summary["triggered_count"],
+        "pie": summary["pie"],
+        "Dominant_Disease": summary["Dominant_Disease"],
+        "Severity": summary["Severity"],
+    })
+
+
+# -------------------------
+# CONVERSATIONAL DEEP DIVE INIT
+# -------------------------
+@app.post("/api/test/deepdive/init")
+def deepdive_init():
+    data = request.get_json(force=True) or {}
+    test_id = int(data.get("test_id") or 0)
+    if not test_id:
+        return jsonify({"ok": False, "message": "Missing test_id"}), 400
+
+    existing = db.session.execute(
+        text("SELECT COUNT(*) FROM dbo.Test_Question_Queue WHERE Test_ID = :tid"),
+        {"tid": test_id},
+    ).scalar() or 0
+
+    if int(existing) > 0:
+        return get_next_question_internal(test_id)
+
+    state_exists = db.session.execute(
+        text("SELECT COUNT(*) FROM dbo.Test_Category_State WHERE Test_ID = :tid"),
+        {"tid": test_id},
+    ).scalar() or 0
+
+    if int(state_exists) == 0:
+        rows = db.session.execute(
+            text("""
+                    SELECT DISTINCT c.Category_ID, c.Category_Key
+                    FROM dbo.Student_Test_Answer a
+                    JOIN dbo.Category_Gates g ON g.Gate_ID = a.Ref_ID
+                    JOIN dbo.Categories c ON c.Category_ID = g.Category_ID
+                    WHERE a.Test_ID = :tid
+                      AND a.Item_Type = 'Gate'
+                      AND (
+                            (c.Category_Key = 'SH' AND a.Answer_Value >= 1)
+                            OR (c.Category_Key != 'SH' AND a.Answer_Value >= 3)
+                          )
+                """),
+            {"tid": test_id},
+        ).fetchall()
+
+        for (cat_id, _) in rows:
+            db.session.execute(
+                text("""
+                        INSERT INTO dbo.Test_Category_State
+                        (Test_ID, Category_ID, Gate_Answer, Current_Base_Order, Is_Completed)
+                        VALUES (:tid, :cid, 1, 0, 0)
+                    """),
+                {"tid": test_id, "cid": cat_id},
+            )
+        db.session.commit()
+
+    category_row = db.session.execute(
+        text("""
+                SELECT TOP 1 tcs.Category_ID, tcs.Current_Base_Order, c.Category_Key
+                FROM dbo.Test_Category_State tcs
+                JOIN dbo.Categories c ON c.Category_ID = tcs.Category_ID
+                WHERE tcs.Test_ID = :tid
+                  AND tcs.Is_Completed = 0
+                ORDER BY tcs.Category_ID
+            """),
+        {"tid": test_id},
+    ).fetchone()
+
+    if not category_row:
+        return jsonify({"ok": False, "message": "No triggered categories found"}), 400
+
+    cat_id, _, _ = category_row
+
+    base_row = db.session.execute(
+        text("""
+                SELECT TOP 1 Base_ID, Base_Order
+                FROM dbo.DeepDive_Base_Questions
+                WHERE Category_ID = :cid
+                  AND Is_Active = 1
+                ORDER BY Base_Order
+            """),
+        {"cid": cat_id},
+    ).fetchone()
+
+    if not base_row:
+        return jsonify({"ok": False, "message": "No base questions for category"}), 400
+
+    base_id, base_order = base_row
+
+    db.session.execute(
+        text("""
+                INSERT INTO dbo.Test_Question_Queue
+                (Test_ID, Item_Type, Ref_ID, Order_Index, Status, Parent_Category_ID)
+                VALUES (:tid, 'Base', :rid, 1, 'Pending', :cid)
+            """),
+        {"tid": test_id, "rid": base_id, "cid": cat_id},
+    )
+
+    db.session.execute(
+        text("""
+                UPDATE dbo.Test_Category_State
+                SET Current_Base_Order = :bo,
+                    Updated_On = SYSUTCDATETIME()
+                WHERE Test_ID = :tid
+                  AND Category_ID = :cid
+            """),
+        {"tid": test_id, "cid": cat_id, "bo": base_order},
+    )
+
+    db.session.commit()
+    return get_next_question_internal(test_id)
+
+
+def get_next_question_internal(test_id):
+    row = db.session.execute(
+        text("""
+                SELECT TOP 1 Queue_ID, Item_Type, Ref_ID, Parent_Category_ID
+                FROM dbo.Test_Question_Queue
+                WHERE Test_ID = :tid
+                  AND Status = 'Pending'
+                ORDER BY Order_Index ASC, Queue_ID ASC
+            """),
+        {"tid": test_id},
+    ).fetchone()
+
+    if not row:
+        incomplete = db.session.execute(
+            text("""
+                    SELECT COUNT(*)
+                    FROM dbo.Test_Category_State
+                    WHERE Test_ID = :tid
+                      AND Is_Completed = 0
+                """),
+            {"tid": test_id},
+        ).scalar() or 0
+
+        if int(incomplete) == 0:
+            return jsonify({"ok": True, "done": True, "message": "Assessment complete"})
+
+        return advance_to_next_category(test_id)
+
+    queue_id, item_type, ref_id, _ = row
+
+    if item_type == "Base":
+        q = db.session.execute(
+            text("""
+                    SELECT b.Base_ID, b.Base_Text, c.Category_Key, c.Category_Name
+                    FROM dbo.DeepDive_Base_Questions b
+                    JOIN dbo.Categories c ON c.Category_ID = b.Category_ID
+                    WHERE b.Base_ID = :id
+                """),
+            {"id": ref_id},
+        ).fetchone()
+    else:
+        q = db.session.execute(
+            text("""
+                    SELECT s.Sub_ID, s.Sub_Text, c.Category_Key, c.Category_Name
+                    FROM dbo.DeepDive_Sub_Questions s
+                    JOIN dbo.DeepDive_Base_Questions b ON b.Base_ID = s.Base_ID
+                    JOIN dbo.Categories c ON c.Category_ID = b.Category_ID
+                    WHERE s.Sub_ID = :id
+                """),
+            {"id": ref_id},
+        ).fetchone()
+
+    return jsonify({
+        "ok": True,
+        "queue_id": queue_id,
+        "item_type": item_type,
+        "question_text": q[1],
+        "category_key": q[2],
+        "category_name": q[3],
+        "options": LIKERT_5,
+        "is_conversational": True,
+    })
+
+
+def advance_to_next_category(test_id):
+    next_cat = db.session.execute(
+        text("""
+                SELECT TOP 1 tcs.Category_ID, c.Category_Key
+                FROM dbo.Test_Category_State tcs
+                JOIN dbo.Categories c ON c.Category_ID = tcs.Category_ID
+                WHERE tcs.Test_ID = :tid
+                  AND tcs.Is_Completed = 0
+                ORDER BY tcs.Category_ID
+            """),
+        {"tid": test_id},
+    ).fetchone()
+
+    if not next_cat:
+        return jsonify({"ok": True, "done": True, "message": "All categories complete"})
+
+    cat_id, _ = next_cat
+
+    base_row = db.session.execute(
+        text("""
+                SELECT TOP 1 Base_ID, Base_Order
+                FROM dbo.DeepDive_Base_Questions
+                WHERE Category_ID = :cid
+                  AND Is_Active = 1
+                ORDER BY Base_Order
+            """),
+        {"cid": cat_id},
+    ).fetchone()
+
+    if not base_row:
+        db.session.execute(
+            text("""
+                    UPDATE dbo.Test_Category_State
+                    SET Is_Completed = 1,
+                        Updated_On = SYSUTCDATETIME()
+                    WHERE Test_ID = :tid
+                      AND Category_ID = :cid
+                """),
+            {"tid": test_id, "cid": cat_id},
+        )
+        db.session.commit()
+        return advance_to_next_category(test_id)
+
+    base_id, base_order = base_row
+
+    db.session.execute(
+        text("""
+                INSERT INTO dbo.Test_Question_Queue
+                (Test_ID, Item_Type, Ref_ID, Order_Index, Status, Parent_Category_ID)
+                VALUES (:tid, 'Base', :rid, 1, 'Pending', :cid)
+            """),
+        {"tid": test_id, "rid": base_id, "cid": cat_id},
+    )
+
+    db.session.execute(
+        text("""
+                UPDATE dbo.Test_Category_State
+                SET Current_Base_Order = :bo,
+                    Updated_On = SYSUTCDATETIME()
+                WHERE Test_ID = :tid
+                  AND Category_ID = :cid
+            """),
+        {"tid": test_id, "cid": cat_id, "bo": base_order},
+    )
+
+    db.session.commit()
+    return get_next_question_internal(test_id)
+
+
+@app.get("/api/test/next")
+def test_next():
+    test_id = request.args.get("test_id")
+    if not test_id:
+        return jsonify({"ok": False, "message": "Missing test_id"}), 400
+    return get_next_question_internal(int(test_id))
+
+
+@app.post("/api/test/answer")
+def test_answer():
+    data = request.get_json(force=True) or {}
+
+    test_id = data.get("test_id")
+    queue_id = data.get("queue_id")
+    score_raw = data.get("score")
+
+    if not test_id or not queue_id or score_raw is None:
+        return jsonify({"ok": False, "message": "Missing test_id, queue_id, or score"}), 400
+
+    try:
+        test_id = int(test_id)
+        queue_id = int(queue_id)
+        score = int(score_raw)
+    except Exception:
+        return jsonify({"ok": False, "message": "Invalid test_id/queue_id/score"}), 400
+
+    status_row = db.session.execute(
+        text("""
+                SELECT Status
+                FROM dbo.Test_Question_Queue
+                WHERE Queue_ID = :qid
+                  AND Test_ID = :tid
+            """),
+        {"qid": queue_id, "tid": test_id},
+    ).fetchone()
+
+    if not status_row or (status_row[0] or "").lower() != "pending":
+        return get_next_question_internal(test_id)
+
+    row = db.session.execute(
+        text("""
+                SELECT
+                    q.Item_Type,
+                    q.Ref_ID,
+                    COALESCE(b.Category_ID, parent_b.Category_ID) AS Category_ID
+                FROM dbo.Test_Question_Queue q WITH (UPDLOCK, ROWLOCK)
+                LEFT JOIN dbo.DeepDive_Base_Questions b
+                    ON b.Base_ID = q.Ref_ID AND q.Item_Type = 'Base'
+                LEFT JOIN dbo.DeepDive_Sub_Questions s
+                    ON s.Sub_ID = q.Ref_ID AND q.Item_Type = 'Sub'
+                LEFT JOIN dbo.DeepDive_Base_Questions parent_b
+                    ON parent_b.Base_ID = s.Base_ID
+                WHERE q.Queue_ID = :qid
+                  AND q.Test_ID = :tid
+            """),
+        {"qid": queue_id, "tid": test_id},
+    ).fetchone()
+
+    if not row:
+        db.session.commit()
+        return get_next_question_internal(test_id)
+
+    item_type, ref_id, category_id = row
+    ref_id = int(ref_id)
+    category_id = int(category_id) if category_id else None
+
+    db.session.execute(
+        text("""
+                INSERT INTO dbo.Student_Test_Answer (Test_ID, Item_Type, Ref_ID, Answer_Value)
+                VALUES (:tid, :t, :rid, :val)
+            """),
+        {"tid": test_id, "t": item_type, "rid": ref_id, "val": score},
+    )
+
+    db.session.execute(
+        text("""
+                UPDATE dbo.Test_Question_Queue
+                SET Status = 'Answered'
+                WHERE Queue_ID = :qid
+                  AND Test_ID = :tid
+            """),
+        {"qid": queue_id, "tid": test_id},
+    )
+
+    if item_type == "Base":
+        threshold_info = db.session.execute(
+            text("""
+                    SELECT c.Category_Key, c.Base_Trigger_Min_Value, b.Trigger_Min_Value, b.Base_Order
+                    FROM dbo.DeepDive_Base_Questions b
+                    JOIN dbo.Categories c ON c.Category_ID = b.Category_ID
+                    WHERE b.Base_ID = :bid
+                """),
+            {"bid": ref_id},
+        ).fetchone()
+
+        # Python now trusts the database's Trigger_Min_Value completely!
+        effective_threshold = threshold_info[2] if threshold_info[2] is not None else threshold_info[1]
+        current_base_order = int(threshold_info[3] or 0)
+
+        if score >= int(effective_threshold or 0):
+            subs = db.session.execute(
+                text("""
+                        SELECT Sub_ID
+                        FROM dbo.DeepDive_Sub_Questions
+                        WHERE Base_ID = :bid
+                          AND Is_Active = 1
+                        ORDER BY Sub_Order
+                    """),
+                {"bid": ref_id},
+            ).fetchall()
+
+            if subs:
+                for idx, (sub_id,) in enumerate(subs, start=2):
+                    db.session.execute(
+                        text("""
+                                INSERT INTO dbo.Test_Question_Queue
+                                (Test_ID, Item_Type, Ref_ID, Order_Index, Status)
+                                VALUES (:tid, 'Sub', :rid, :ord, 'Pending')
+                            """),
+                        {"tid": test_id, "rid": int(sub_id), "ord": idx},
+                    )
+            else:
+                insert_next_base(test_id, category_id, current_base_order)
+        else:
+            insert_next_base(test_id, category_id, current_base_order)
+
+    elif item_type == "Sub":
+        more_pending = db.session.execute(
+            text("""
+                    SELECT COUNT(*)
+                    FROM dbo.Test_Question_Queue
+                    WHERE Test_ID = :tid
+                      AND Status = 'Pending'
+                """),
+            {"tid": test_id},
+        ).scalar() or 0
+
+        if int(more_pending) == 0:
+            state_row = db.session.execute(
+                text("""
+                        SELECT Current_Base_Order
+                        FROM dbo.Test_Category_State
+                        WHERE Test_ID = :tid
+                          AND Category_ID = :cid
+                    """),
+                {"tid": test_id, "cid": category_id},
+            ).fetchone()
+            current_bo = int(state_row[0]) if state_row and state_row[0] is not None else 0
+            insert_next_base(test_id, category_id, current_bo)
+
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+def insert_next_base(test_id, category_id, current_base_order):
+    any_pending = db.session.execute(
+        text("""
+                SELECT COUNT(*)
+                FROM dbo.Test_Question_Queue
+                WHERE Test_ID = :tid
+                  AND Status = 'Pending'
+            """),
+        {"tid": test_id},
+    ).scalar() or 0
+
+    if int(any_pending) > 0:
+        return
+
+    next_base = db.session.execute(
+        text("""
+                SELECT TOP 1 Base_ID, Base_Order
+                FROM dbo.DeepDive_Base_Questions
+                WHERE Category_ID = :cid
+                  AND Base_Order > :current_order
+                  AND Is_Active = 1
+                ORDER BY Base_Order
+            """),
+        {"cid": category_id, "current_order": current_base_order},
+    ).fetchone()
+
+    if next_base:
+        base_id, base_order = next_base
+
+        max_order = db.session.execute(
+            text("""
+                    SELECT COALESCE(MAX(Order_Index), 0)
+                    FROM dbo.Test_Question_Queue
+                    WHERE Test_ID = :tid
+                """),
+            {"tid": test_id},
+        ).scalar() or 0
+
+        new_order = int(max_order) + 10
+
+        db.session.execute(
+            text("""
+                    INSERT INTO dbo.Test_Question_Queue
+                    (Test_ID, Item_Type, Ref_ID, Order_Index, Status, Parent_Category_ID)
+                    VALUES (:tid, 'Base', :rid, :ord, 'Pending', :cid)
+                """),
+            {"tid": test_id, "rid": base_id, "ord": new_order, "cid": category_id},
+        )
+
+        db.session.execute(
+            text("""
+                    UPDATE dbo.Test_Category_State
+                    SET Current_Base_Order = :bo,
+                        Updated_On = SYSUTCDATETIME()
+                    WHERE Test_ID = :tid
+                      AND Category_ID = :cid
+                """),
+            {"tid": test_id, "cid": category_id, "bo": base_order},
+        )
+    else:
+        db.session.execute(
+            text("""
+                    UPDATE dbo.Test_Category_State
+                    SET Is_Completed = 1,
+                        Updated_On = SYSUTCDATETIME()
+                    WHERE Test_ID = :tid
+                      AND Category_ID = :cid
+                """),
+            {"tid": test_id, "cid": category_id},
+        )
+
+
+# ==========================================
+# PSYCHOLOGIST DASHBOARD ENDPOINTS
+# ==========================================
+
+@app.get("/api/psychologist/dashboard")
+def get_psychologist_dashboard():
+    """
+    Fetches ONLY the students referred to THIS specific psychologist.
+    Uses Psychologist_ID stored on the referral record.
+    """
+    psy_id = request.args.get("psychologist_id")
+
+    if not psy_id:
+        return jsonify({"ok": False, "message": "Missing psychologist_id"}), 400
+
+    try:
+        psychologist = db.session.execute(
+            text("SELECT Name, Credentials, Available_Day FROM dbo.Psychologists WHERE Psychologist_ID = :pid"),
+            {"pid": psy_id}
+        ).fetchone()
+
+        if not psychologist:
+            return jsonify({"ok": False, "message": "Psychologist not found"}), 404
+
+        # Fetch students referred to THIS psychologist.
+        # Include both 'Pending' and 'Meeting_Requested' so students
+        # don't vanish after a meeting is initiated.
+        referred_students = db.session.execute(
+            text("""
+                SELECT DISTINCT s.Student_ID, s.Student_Name, s.Arid_No, sr.Referred_On, a.Advisor_Name
+                FROM dbo.Students s
+                INNER JOIN dbo.Student_Referrals sr ON s.Student_ID = sr.Student_ID
+                LEFT JOIN dbo.Advisors a ON sr.Advisor_ID = a.Advisor_ID
+                WHERE sr.Psychologist_ID = :pid
+                  AND sr.Status IN ('Pending', 'Meeting_Requested')
+                ORDER BY sr.Referred_On DESC
+            """),
+            {"pid": psy_id}
+        ).fetchall()
+
+        students_list = [
+            {"id": r[0], "name": r[1], "arid": r[2], "advisor_name": r[4] or "Unknown Advisor"}
+            for r in referred_students
+        ]
+
+        return jsonify({
+            "ok": True,
+            "name": psychologist[0],
+            "credentials": psychologist[1],
+            "available_day": psychologist[2],
+            "urgent_students": students_list
+        })
+
+    except Exception as e:
+        print(f"Psychologist Dashboard Error: {e}")
+        return jsonify({"ok": False, "message": "Server error"}), 500
+
+
+# ==========================================
+# ADD THIS to your Flask backend
+# Place it near the other /api/advisor/ routes
+# (e.g. right after propose_advisor_meeting)
+# ==========================================
+
+@app.get("/api/advisor/booked-slots")
+def get_advisor_booked_slots():
+    """
+    Returns all upcoming accepted/proposed advisor meeting slots
+    so the advisor can see conflicts before proposing a new time.
+    """
+    advisor_id = request.args.get("advisor_id")
+    if not advisor_id:
+        return jsonify({"ok": False, "message": "Missing advisor_id"}), 400
+
+    try:
+        rows = db.session.execute(
+            text("""
+                SELECT
+                    s.Student_Name,
+                    m.Proposed_Slots,
+                    m.Confirmed_Slot,
+                    m.Status
+                FROM dbo.Advisor_Student_Meetings m
+                INNER JOIN dbo.Students s ON m.Student_ID = s.Student_ID
+                WHERE m.Advisor_ID = :aid
+                  AND m.Status IN ('Proposed', 'Accepted')
+                  AND (
+                      m.Proposed_Slots IS NOT NULL
+                      OR m.Confirmed_Slot IS NOT NULL
+                  )
+                ORDER BY m.Proposed_Slots DESC
+            """),
+            {"aid": advisor_id}
+        ).fetchall()
+
+        booked = []
+        for r in rows:
+            # Use Confirmed_Slot if accepted, else Proposed_Slots
+            dt_str = r[2] if r[3] == 'Accepted' and r[2] else r[1]
+            if not dt_str:
+                continue
+            booked.append({
+                "student_name": r[0],
+                "datetime": dt_str,  # ISO string or datetime string
+                "status": r[3]
+            })
+
+        return jsonify({"ok": True, "booked_slots": booked})
+
+    except Exception as e:
+        print(f"Booked slots error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+# -------------------------
+# RESULT ENDPOINTS
+# -------------------------
+@app.get("/api/test/result")
+def test_result():
+    test_id = request.args.get("test_id")
+    if not test_id:
+        return jsonify({"ok": False, "message": "Missing test_id"}), 400
+
+    summary = build_test_summary(int(test_id))
+
+    return jsonify({
+        "ok": True,
+        "test_id": int(test_id),
+        "triggered_categories": summary["triggered_categories"],
+        "triggered_count": summary["triggered_count"],
+        "pie": summary["pie"],
+        "Dominant_Disease": summary["Dominant_Disease"],
+        "Severity": summary["Severity"],
+    })
+
+
+@app.get("/api/test/latest")
+def latest_test():
+    arid_no = (request.args.get("arid_no") or "").strip()
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    sid = get_student_id_by_arid(arid_no)
+    if not sid:
+        return jsonify({"ok": False, "message": "Student not found"}), 404
+
+    row = db.session.execute(
+        text("""
+                SELECT TOP 1 Test_ID, Status, Started_On
+                FROM dbo.Test_Session
+                WHERE Student_ID = :sid
+                ORDER BY Test_ID DESC
+            """),
+        {"sid": sid},
+    ).fetchone()
+
+    if not row:
+        return jsonify({"ok": True, "exists": False})
+
+    return jsonify({
+        "ok": True,
+        "exists": True,
+        "test_id": int(row[0]),
+        "status": row[1],
+        "created_on": str(row[2]),
+    })
+
+
+@app.post("/api/test/cleanup")
+def cleanup_test():
+    data = request.get_json(force=True) or {}
+    test_id = data.get("test_id")
+
+    if not test_id:
+        return jsonify({"ok": False, "message": "Missing test_id"}), 400
+
+    db.session.execute(
+        text("""
+                DELETE FROM dbo.Test_Question_Queue
+                WHERE Test_ID = :tid
+                  AND Status = 'Pending'
+            """),
+        {"tid": test_id},
+    )
+
+    db.session.execute(
+        text("""
+                UPDATE dbo.Test_Category_State
+                SET Is_Completed = 0,
+                    Current_Base_Order = 0
+                WHERE Test_ID = :tid
+            """),
+        {"tid": test_id},
+    )
+
+    db.session.commit()
+    return jsonify({"ok": True, "message": "Test reset, call /api/test/deepdive/init again"})
+
+
+# -------------------------
+# REMEDIES ENDPOINTS
+# -------------------------
+@app.get("/api/remedies/recommend")
+def recommend_remedies():
+    arid_no = (request.args.get("arid_no") or "").strip()
+    test_id = request.args.get("test_id")
+    max_duration = request.args.get("max_duration", 30)
+
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    sid = get_student_id_by_arid(arid_no)
+    if not sid:
+        return jsonify({"ok": False, "message": "Student not found"}), 404
+
+    try:
+        max_duration = int(max_duration)
+    except Exception:
+        max_duration = 30
+
+    if not test_id:
+        row = db.session.execute(
+            text("""
+                    SELECT TOP 1 Test_ID
+                    FROM dbo.Test_Session
+                    WHERE Student_ID = :sid
+                    ORDER BY Test_ID DESC
+                """),
+            {"sid": sid},
+        ).fetchone()
+        if not row:
+            return jsonify({"ok": False, "message": "No test found. Please complete an assessment first."}), 404
+        test_id = int(row[0])
+    else:
+        test_id = int(test_id)
+
+    summary = build_test_summary(test_id)
+    profile_ctx = map_profile_context(sid)
+
+    if is_emergency_case(summary):
+        protocols = safe_fetch_emergency_protocols()
+        return jsonify({
+            "ok": True,
+            "is_emergency": True,
+            "message": "Your responses suggest you may need immediate support. Please follow the steps below right now.",
+            "emergency_protocols": protocols,
+            "student_context": {
+                "student_id": sid,
+                "test_id": test_id,
+                "dominant_disease": summary["Dominant_Disease"],
+                "severity": summary["Severity"],
+                "disease_breakdown": summary["pie"],
+                "triggered_categories": [x["Category_Short_Name"] for x in summary["triggered_categories"]],
+            },
+        })
+
+    remedies = safe_fetch_remedies(summary, profile_ctx, max_duration=max_duration)
+    grouped = group_remedies_by_duration(remedies)
+    modality_distribution = build_modality_distribution(remedies)
+    rules_applied = build_rules_applied(summary, profile_ctx, remedies)
+
+    return jsonify({
+        "ok": True,
+        "is_emergency": False,
+        "student_context": {
+            "student_id": sid,
+            "test_id": test_id,
+            "dominant_disease": summary["Dominant_Disease"],
+            "severity": summary["Severity"],
+            "disease_breakdown": summary["pie"],
+            "triggered_categories": [x["Category_Short_Name"] for x in summary["triggered_categories"]],
+            "profile_applied": {
+                "gender": profile_ctx["gender"],
+                "living_situation": profile_ctx["living_situation"],
+                "income_context": profile_ctx["income_context"],
+            },
+        },
+        "remedies": {
+            "all_remedies": remedies,
+            "by_duration": grouped,
+        },
+        "modality_distribution": modality_distribution,
+        "rules_applied": rules_applied,
+    })
+
+
+@app.post("/api/remedies/acknowledge-emergency")
+def acknowledge_emergency():
+    data = request.get_json(force=True) or {}
+    test_id = data.get("test_id")
+    arid_no = (data.get("arid_no") or "").strip()
+    acknowledged_protocols = data.get("acknowledged_protocols") or []
+
+    if not test_id or not arid_no:
+        return jsonify({"ok": False, "message": "Missing test_id or arid_no"}), 400
+
+    sid = get_student_id_by_arid(arid_no)
+    if not sid:
+        return jsonify({"ok": False, "message": "Student not found"}), 404
+
+    try:
+        try_insert_remedy_history(
+            student_id=sid,
+            test_id=int(test_id),
+            remedy_id=0,
+            status="EmergencyAcknowledged",
+            rating=None,
+            feedback_text="Protocols: " + ", ".join(str(x) for x in acknowledged_protocols),
+        )
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+
+    return jsonify({"ok": True, "message": "Emergency acknowledgment recorded"})
+
+
+@app.post("/api/remedies/feedback")
+def save_remedy_feedback():
+    data = request.json
+    arid_no = data.get("arid_no")
+    test_id = data.get("test_id")  # The frontend might not send this
+
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    try:
+        student_id = get_student_id_by_arid(arid_no)
+        if not student_id:
+            return jsonify({"ok": False, "message": "Student not found"}), 404
+
+        # THE FIX: If React didn't send a test_id, automatically fetch their latest one!
+        if not test_id:
+            test_id = db.session.execute(
+                text("SELECT TOP 1 Test_ID FROM dbo.Test_Session WHERE Student_ID = :sid ORDER BY Started_On DESC"),
+                {"sid": student_id}
+            ).scalar()
+
+        if not test_id:
+            return jsonify({"ok": False, "message": "No test history found to link this remedy to."}), 400
+
+        db.session.execute(
+            text("""
+                    EXEC dbo.sp_RecordRemedyFeedback
+                        @Student_ID = :sid,
+                        @Test_ID = :tid,
+                        @Remedy_ID = :rid,
+                        @Status = :status,
+                        @Rating = :rating,
+                        @Feedback_Text = :feedback,
+                        @Dismissed_Reason = NULL
+                """),
+            {
+                "sid": student_id,
+                "tid": test_id,
+                "rid": data.get("remedy_id"),
+                "status": data.get("status"),
+                "rating": data.get("rating"),
+                "feedback": data.get("feedback_text", "")
+            }
+        )
+
+        db.session.commit()
+        return jsonify({"ok": True, "message": "Remedy feedback securely logged!"})
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"Student_Remedy_History update failed: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+# ==========================================
+# ADVISOR DASHBOARD ENDPOINTS
+# ==========================================
+
+@app.get("/api/advisor/dashboard")
+def get_advisor_dashboard():
+    """Fetches the main dashboard metrics for a specific advisor"""
+    adv_id = request.args.get("advisor_id")
+
+    if not adv_id:
+        return jsonify({"ok": False, "message": "Missing advisor_id"}), 400
+
+    try:
+        advisor = db.session.execute(
+            text("SELECT Advisor_Name FROM dbo.Advisors WHERE Advisor_ID = :aid"),
+            {"aid": adv_id}
+        ).fetchone()
+
+        if not advisor:
+            return jsonify({"ok": False, "message": "Advisor not found"}), 404
+
+        assigned_count = db.session.execute(
+            text("SELECT COUNT(*) FROM dbo.Students WHERE Advisor_ID = :aid"),
+            {"aid": adv_id}
+        ).scalar()
+
+        # FIXED: Added CONDITION 3 to check Student_Test_Answer for SH triggers
+        high_alert_students = db.session.execute(
+            text("""
+                    SELECT DISTINCT s.Student_ID, s.Student_Name, s.Arid_No
+                    FROM dbo.Students s
+                    WHERE s.Advisor_ID = :aid AND (
+
+                        -- CONDITION 1: General Test Result has High/Severe severity
+                        EXISTS (
+                            SELECT 1 FROM dbo.General_Test_Result g 
+                            WHERE g.Student_ID = s.Student_ID 
+                            AND (g.Severity_Label LIKE '%High%' OR g.Severity_Label LIKE '%Severe%')
+                        )
+                        OR 
+
+                        -- CONDITION 2: Weekly Check-In triggered SH or high score
+                        EXISTS (
+                            SELECT 1 FROM dbo.Weekly_CheckIn_Session w 
+                            WHERE w.Student_ID = s.Student_ID 
+                            AND (
+                                w.Triggered_Disease LIKE '%SH%' OR 
+                                w.Triggered_Disease LIKE '%Self%' OR
+                                w.Triggered_Category_Key LIKE '%SH%' OR 
+                                w.Triggered_Category_Key LIKE '%Self%' OR
+                                w.Total_Score >= 15
+                            )
+                        )
+                        OR
+
+                        -- CONDITION 3: MAIN ASSESSMENT triggered SH category (THE MISSING PIECE!)
+                        EXISTS (
+                            SELECT 1 
+                            FROM dbo.Test_Session ts
+                            JOIN dbo.Student_Test_Answer sta ON sta.Test_ID = ts.Test_ID
+                            JOIN dbo.Category_Gates cg ON cg.Gate_ID = sta.Ref_ID
+                            JOIN dbo.Categories c ON c.Category_ID = cg.Category_ID
+                            WHERE ts.Student_ID = s.Student_ID
+                              AND sta.Item_Type = 'Gate'
+                              AND c.Category_Key = 'SH'
+                              AND sta.Answer_Value >= 1   -- SH triggers at >= 1 (not >= 3 like others)
+                        )
+                    )
+                """),
+            {"aid": adv_id}
+        ).fetchall()
+
+        students_list = [{"id": r[0], "name": r[1], "arid": r[2]} for r in high_alert_students]
+
+        return jsonify({
+            "ok": True,
+            "advisor_name": advisor[0],
+            "assigned_count": assigned_count,
+            "high_severity_count": len(students_list),
+            "high_alert_students": students_list
+        })
+
+    except Exception as e:
+        print(f"Advisor Dashboard Error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+    except Exception as e:
+        print(f"Advisor Dashboard Error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.post("/api/advisor/refer-student")
+def refer_student_to_psychologist():
+    """
+    Refers a student to a psychologist.
+    - Cleans up any stuck/broken referral rows (NULL or unknown status) first.
+    - If student was previously referred and had a completed meeting → re-refer same psychologist.
+    - First time → assign least busy psychologist.
+    """
+    data = request.get_json()
+    arid_no = data.get("arid_no")
+    adv_id = data.get("advisor_id")
+
+    if not arid_no or not adv_id:
+        return jsonify({"ok": False, "message": "Missing data"}), 400
+
+    try:
+        # 1. Get Student ID
+        student = db.session.execute(
+            text("SELECT Student_ID FROM dbo.Students WHERE Arid_No = :arid"),
+            {"arid": arid_no}
+        ).fetchone()
+
+        if not student:
+            return jsonify({"ok": False, "message": "Student not found"}), 404
+
+        sid = student[0]
+
+        # 2. FIX: Clean up any stuck rows with NULL or unknown status before checking.
+        # These are leftovers from old broken inserts. Delete them so they don't
+        # permanently block new referrals.
+        db.session.execute(
+            text("""
+                DELETE FROM dbo.Student_Referrals
+                WHERE Student_ID = :sid
+                  AND (Status IS NULL OR Status NOT IN ('Pending', 'Meeting_Requested', 'Completed', 'Cancelled'))
+            """),
+            {"sid": sid}
+        )
+        db.session.commit()
+
+        # 3. Now check for a genuinely active referral (Pending or Meeting_Requested)
+        already_referred = db.session.execute(
+            text("""
+                SELECT Referral_ID, Psychologist_ID
+                FROM dbo.Student_Referrals
+                WHERE Student_ID = :sid
+                AND Psychologist_ID IS NOT NULL
+                AND Status IN ('Pending', 'Meeting_Requested')
+            """),
+            {"sid": sid}
+        ).fetchone()
+
+        if already_referred:
+            # Return already_referred=True so the frontend knows this is NOT a new referral
+            return jsonify({
+                "ok": True,
+                "already_referred": True,
+                "message": "Student already has an active referral pending with the psychologist."
+            }), 200
+
+        # 4. Check if student has a previous COMPLETED referral → re-refer to same psychologist
+        previous = db.session.execute(
+            text("""
+                SELECT TOP 1 sr.Psychologist_ID, p.Name
+                FROM dbo.Student_Referrals sr
+                INNER JOIN dbo.Psychologists p ON sr.Psychologist_ID = p.Psychologist_ID
+                WHERE sr.Student_ID = :sid
+                  AND sr.Status = 'Completed'
+                  AND sr.Psychologist_ID IS NOT NULL
+                ORDER BY sr.Referred_On DESC
+            """),
+            {"sid": sid}
+        ).fetchone()
+
+        if previous:
+            assigned_psy_id = previous[0]
+            assigned_psy_name = previous[1]
+            note = f"Re-referred to same psychologist: {assigned_psy_name}"
+        else:
+            # First time — pick least busy psychologist by active referral count
+            least_busy = db.session.execute(
+                text("""
+                    SELECT TOP 1 p.Psychologist_ID, p.Name
+                    FROM dbo.Psychologists p
+                    LEFT JOIN dbo.Student_Referrals sr
+                        ON p.Psychologist_ID = sr.Psychologist_ID
+                        AND sr.Status IN ('Pending', 'Meeting_Requested')
+                    GROUP BY p.Psychologist_ID, p.Name
+                    ORDER BY COUNT(sr.Student_ID) ASC
+                """)
+            ).fetchone()
+
+            if not least_busy:
+                return jsonify({"ok": False, "message": "No psychologists available in the system."}), 500
+
+            assigned_psy_id = least_busy[0]
+            assigned_psy_name = least_busy[1]
+            note = f"First referral — assigned to: {assigned_psy_name}"
+
+        # 5. Insert with explicit Status='Pending' and Referred_On timestamp
+        db.session.execute(
+            text("""
+                INSERT INTO dbo.Student_Referrals
+                (
+                    Student_ID,
+                    Advisor_ID,
+                    Psychologist_ID,
+                    Status,
+                    Referred_On
+                )
+                VALUES
+                (
+                    :sid,
+                    :aid,
+                    :pid,
+                    'Pending',
+                    SYSUTCDATETIME()
+                )
+            """),
+            {
+                "sid": sid,
+                "aid": adv_id,
+                "pid": assigned_psy_id
+            }
+        )
+
+        db.session.commit()
+
+        print(f"[REFERRAL] Student {arid_no} → Psychologist {assigned_psy_name} (ID:{assigned_psy_id}) | {note}")
+        return jsonify({
+            "ok": True,
+            "already_referred": False,
+            "message": "Referral successful",
+            "psychologist_name": assigned_psy_name,
+            "note": note
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"[REFERRAL ERROR] {e}")
+        return jsonify({"ok": False, "message": f"Server error: {str(e)}"}), 500
+
+
+# Add these endpoints to your new python.txt (Flask backend)
+
+# ==========================================
+# REMEDY LIBRARY BUILDER ENDPOINTS
+# ==========================================
+
+@app.route("/api/clinical/remedies", methods=["GET", "POST", "PUT", "DELETE"])
+def clinical_remedies():
+    if request.method == "GET":
+        try:
+            rows = db.session.execute(text("""
+                SELECT 
+                    r.Remedy_ID, r.Title, r.Description, r.Remedy_Type, 
+                    r.Target_Disease, r.Target_Severity, r.Linked_Sub_Category_ID,
+                    r.Duration_Minutes, r.Resource_Link, r.Is_Premium, 
+                    r.Is_Active, r.Usage_Count, r.Average_Rating, r.Created_On
+                FROM dbo.Remedy_Library r
+                ORDER BY r.Created_On DESC
+            """)).fetchall()
+
+            data = []
+            for r in rows:
+                data.append({
+                    "Remedy_ID": r[0],
+                    "Title": r[1],
+                    "Description": r[2],
+                    "Remedy_Type": r[3],
+                    "Target_Disease": r[4],
+                    "Target_Severity": r[5],
+                    "Linked_Sub_Category_ID": r[6],
+                    "Duration_Minutes": r[7],
+                    "Resource_Link": r[8],
+                    "Is_Premium": bool(r[9]),
+                    "Is_Active": bool(r[10]),
+                    "Usage_Count": r[11],
+                    "Average_Rating": float(r[12]) if r[12] is not None else None,
+                    "Created_On": str(r[13]) if r[13] else None
+                })
+            return jsonify({"ok": True, "data": data})
+        except Exception as e:
+            print(f"Remedies GET error: {e}")
+            return jsonify({"ok": False, "message": str(e)}), 500
+
+    elif request.method == "POST":
+        d = request.json
+        try:
+            db.session.execute(
+                text("""
+                    INSERT INTO dbo.Remedy_Library 
+                    (Title, Description, Remedy_Type, Target_Disease, Target_Severity, 
+                     Linked_Sub_Category_ID, Duration_Minutes, Resource_Link, Is_Premium, Is_Active)
+                    VALUES 
+                    (:title, :desc, :rtype, :tdisease, :tsev, :subcat, :dur, :reslink, :premium, :active)
+                """),
+                {
+                    "title": str(d.get("Title", "")).strip(),
+                    "desc": str(d.get("Description") or "").strip() or None,
+                    "rtype": str(d.get("Remedy_Type", "")).strip(),
+                    "tdisease": str(d.get("Target_Disease") or "").strip() or None,
+                    "tsev": str(d.get("Target_Severity") or "").strip() or None,
+                    "subcat": str(d.get("Linked_Sub_Category_ID") or "").strip() or None,
+                    "dur": int(d.get("Duration_Minutes", 10)),
+                    "reslink": str(d.get("Resource_Link") or "").strip() or None,
+                    "premium": 1 if d.get("Is_Premium") else 0,
+                    "active": 1 if d.get("Is_Active", True) else 0
+                }
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Remedy added successfully!"})
+        except Exception as e:
+            db.session.rollback()
+            print(f"Remedy POST error: {e}")
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "PUT":
+        d = request.json
+        try:
+            db.session.execute(
+                text("""
+                    UPDATE dbo.Remedy_Library 
+                    SET Title=:title, Description=:desc, Remedy_Type=:rtype, 
+                        Target_Disease=:tdisease, Target_Severity=:tsev,
+                        Linked_Sub_Category_ID=:subcat, Duration_Minutes=:dur,
+                        Resource_Link=:reslink, Is_Premium=:premium, Is_Active=:active
+                    WHERE Remedy_ID=:id
+                """),
+                {
+                    "title": str(d.get("Title", "")).strip(),
+                    "desc": str(d.get("Description") or "").strip() or None,
+                    "rtype": str(d.get("Remedy_Type", "")).strip(),
+                    "tdisease": str(d.get("Target_Disease") or "").strip() or None,
+                    "tsev": str(d.get("Target_Severity") or "").strip() or None,
+                    "subcat": str(d.get("Linked_Sub_Category_ID") or "").strip() or None,
+                    "dur": int(d.get("Duration_Minutes", 10)),
+                    "reslink": str(d.get("Resource_Link") or "").strip() or None,
+                    "premium": 1 if d.get("Is_Premium") else 0,
+                    "active": 1 if d.get("Is_Active", True) else 0,
+                    "id": int(d.get("Remedy_ID"))
+                }
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Remedy updated!"})
+        except Exception as e:
+            db.session.rollback()
+            print(f"Remedy PUT error: {e}")
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "DELETE":
+        try:
+            db.session.execute(
+                text("DELETE FROM dbo.Remedy_Library WHERE Remedy_ID=:id"),
+                {"id": int(request.json.get("id"))}
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Remedy deleted!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify(
+                {"ok": False, "message": "Cannot delete remedy. It may be referenced in student history."}), 400
+
+
+@app.get("/api/clinical/sub_categories")
+def clinical_sub_categories():
+    """Fetch all active sub-categories for remedy linking"""
+    try:
+        rows = db.session.execute(text("""
+            SELECT s.Sub_Category_ID, s.Sub_Category_Key, s.Sub_Category_Name, 
+                   c.Category_Name, s.Context_Why, s.Severity_Tag
+            FROM dbo.Sub_Categories s
+            JOIN dbo.Categories c ON s.Category_ID = c.Category_ID
+            WHERE s.Is_Active = 1
+            ORDER BY c.Category_Name, s.Sub_Category_Key
+        """)).fetchall()
+
+        data = []
+        for r in rows:
+            data.append({
+                "Sub_Category_ID": r[0],
+                "Sub_Category_Key": r[1],
+                "Sub_Category_Name": r[2],
+                "Category_Name": r[3],
+                "Context_Why": r[4],
+                "Severity_Tag": r[5]
+            })
+        return jsonify({"ok": True, "data": data})
+    except Exception as e:
+        print(f"Sub-categories error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.get("/api/remedies/history")
+def remedies_history():
+    arid_no = (request.args.get("arid_no") or "").strip()
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    sid = get_student_id_by_arid(arid_no)
+    if not sid:
+        return jsonify({"ok": False, "message": "Student not found"}), 404
+
+    try:
+        # Check if table exists
+        rows = db.session.execute(
+            text("""
+                    SELECT
+                        h.History_ID,
+                        h.Test_ID,
+                        h.Remedy_ID,
+                        h.Status,
+                        h.Feedback_Rating as Rating,  -- Note: column name may differ
+                        h.Feedback_Text,
+                        h.Suggested_On as Created_On,
+                        h.Completed_On,
+                        h.Viewed_On,
+                        h.Dismissed_On,
+                        r.Title,
+                        r.Remedy_Type as Type,
+                        r.Duration_Minutes,
+                        r.Resource_Link
+                    FROM dbo.Student_Remedy_History h
+                    LEFT JOIN dbo.Remedy_Library r ON r.Remedy_ID = h.Remedy_ID
+                    WHERE h.Student_ID = :sid
+                    ORDER BY h.Suggested_On DESC
+                """),
+            {"sid": sid},
+        ).fetchall()
+
+        # Organize into toolkit format expected by frontend
+        toolkit = {
+            "completed": [],
+            "saved": [],
+            "rated": [],
+            "dismissed": []
+        }
+
+        total_suggested = 0
+
+        for r in rows:
+            status = r[3]
+            item = {
+                "history_id": int(r[0]) if r[0] else None,
+                "test_id": int(r[1]) if r[1] else None,
+                "remedy_id": int(r[2]) if r[2] else None,
+                "status": status,
+                "rating": int(r[4]) if r[4] else None,
+                "feedback_text": r[5],
+                "suggested_on": str(r[6]) if r[6] else None,
+                "completed_on": str(r[7]) if r[7] else None,
+                "title": r[10] or "Unknown Remedy",
+                "type": r[11] or "General",
+                "duration_minutes": int(r[12]) if r[12] else 10,
+                "resource_link": r[13]
+            }
+
+            total_suggested += 1
+
+            # Categorize for tabs
+            if status == "Completed":
+                toolkit["completed"].append(item)
+                if item["rating"]:
+                    toolkit["rated"].append(item)
+            elif status == "Saved":
+                toolkit["saved"].append(item)
+            elif status == "Dismissed":
+                toolkit["dismissed"].append(item)
+            elif status in ["Suggested", "Viewed"]:
+                toolkit["saved"].append(item)  # Active remedies go to saved tab
+
+        completed_count = len(toolkit["completed"])
+        completion_rate = (completed_count / total_suggested * 100) if total_suggested > 0 else 0
+
+        return jsonify({
+            "ok": True,
+            "toolkit": toolkit,
+            "total_remedies_suggested": total_suggested,
+            "completion_rate": round(completion_rate, 1)
+        })
+
+    except Exception as e:
+        print("Remedy history error:", e)
+        # Return empty structure on error so UI doesn't crash
+        return jsonify({
+            "ok": True,  # Return ok=True to prevent UI error state
+            "toolkit": {"completed": [], "saved": [], "rated": [], "dismissed": []},
+            "total_remedies_suggested": 0,
+            "completion_rate": 0,
+            "message": "History table may not exist or schema mismatch"
+        })
+
+
+# =========================
+# DASHBOARD API ENDPOINTS
+# =========================
+
+@app.get("/api/test/history")
+def get_test_history():
+    """Get all completed test sessions for a student with accurate summary data"""
+    arid_no = request.args.get("arid_no")
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    try:
+        student_id = get_student_id_by_arid(arid_no)
+        if not student_id:
+            return jsonify({"ok": False, "message": "Student not found"}), 404
+
+        # FIX 1: Join with Student_Test_Answer to ONLY pull tests where the user actually answered questions
+        rows = db.session.execute(
+            text("""
+                    SELECT DISTINCT ts.Test_ID, ts.Started_On, ts.Status
+                    FROM dbo.Test_Session ts
+                    JOIN dbo.Student_Test_Answer sta ON sta.Test_ID = ts.Test_ID
+                    WHERE ts.Student_ID = :sid
+                    ORDER BY ts.Started_On DESC
+                """),
+            {"sid": student_id}
+        ).fetchall()
+
+        sessions = []
+        for idx, row in enumerate(rows):
+            test_id, started_on, status = row
+
+            # FIX 2: Use our trusted calculation engine to get accurate percentages on the fly
+            summary = build_test_summary(test_id)
+
+            sessions.append({
+                "test_id": test_id,
+                "session_number": len(rows) - idx,
+                "date": started_on.isoformat() if hasattr(started_on, 'isoformat') else str(started_on),
+                "status": status,
+                "stress": summary["pie"]["stress"],
+                "anxiety": summary["pie"]["anxiety"],
+                "depression": summary["pie"]["depression"],
+                "dominant_disease": summary["Dominant_Disease"],
+                "severity": summary["Severity"],
+                "triggered": [c["Category_Short_Name"] for c in summary["triggered_categories"]]
+            })
+
+        return jsonify({
+            "ok": True,
+            "sessions": sessions
+        })
+
+    except Exception as e:
+        print(f"History error: {e}")
+        return jsonify({
+            "ok": False,
+            "message": f"Error loading history: {str(e)}"
+        }), 500
+
+
+# ==========================================
+# WEEKLY CHECK-IN & MLE ENDPOINTS
+# ==========================================
+@app.get("/api/weekly-checkin/init")
+def init_weekly_checkin():
+    """Fetches ONLY the 5 category questions based on recent test data (MLE moved to daily)."""
+    arid_no = request.args.get("arid_no")
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    try:
+        student_id = get_student_id_by_arid(arid_no)
+        if not student_id:
+            return jsonify({"ok": False, "message": "Student not found"}), 404
+
+        # Determine Triggered Category
+        cat_row = db.session.execute(
+            text("""
+                    SELECT TOP 1 c.Category_Key, c.Category_Name
+                    FROM dbo.Test_Session ts
+                    JOIN dbo.Student_Test_Answer sta ON ts.Test_ID = sta.Test_ID
+                    JOIN dbo.Category_Gates cg ON sta.Ref_ID = cg.Gate_ID
+                    JOIN dbo.Categories c ON cg.Category_ID = c.Category_ID
+                    WHERE ts.Student_ID = :sid AND sta.Item_Type = 'Gate'
+                    ORDER BY ts.Started_On DESC, sta.Answer_Value DESC
+                """), {"sid": student_id}
+        ).fetchone()
+
+        triggered_key = cat_row[0] if cat_row else "AC"
+        triggered_name = cat_row[1] if cat_row else "Academic Performance"
+
+        weekly_qs = db.session.execute(
+            text(
+                "SELECT Question_ID, Question_Text, Is_Reversed FROM dbo.Weekly_Wellness_Questions WHERE Category_Key = :cat"),
+            {"cat": triggered_key}
+        ).fetchall()
+
+        return jsonify({
+            "ok": True,
+            "triggered_category_key": triggered_key,
+            "triggered_category_name": triggered_name,
+            "weekly_questions": [{"id": q[0], "text": q[1], "reversed": bool(q[2])} for q in weekly_qs]
+        })
+
+    except Exception as e:
+        print(f"Weekly Init Error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.post("/api/weekly-checkin/submit")
+def submit_weekly_checkin():
+    """Saves the weekly check-in session and wellness answers (No MLEs)."""
+    data = request.json
+    arid_no = data.get("arid_no")
+
+    try:
+        student_id = get_student_id_by_arid(arid_no)
+
+        session_id = db.session.execute(
+            text("""
+                    INSERT INTO dbo.Weekly_CheckIn_Session 
+                    (Student_ID, Triggered_Category_Key, Triggered_Disease, Total_Score)
+                    OUTPUT INSERTED.Session_ID
+                    VALUES (:sid, :cat_key, :disease, :total_score)
+                """),
+            {
+                "sid": student_id,
+                "cat_key": data.get("category_key"),
+                "disease": data.get("dominant_disease", "Stress"),
+                "total_score": data.get("total_score", 0)
+            }
+        ).scalar()
+
+        for ans in data.get("weekly_answers", []):
+            db.session.execute(
+                text(
+                    "INSERT INTO dbo.Weekly_CheckIn_Answers (Session_ID, Question_ID, Answer_Value) VALUES (:sess_id, :q_id, :val)"),
+                {"sess_id": session_id, "q_id": ans["id"], "val": ans["value"]}
+            )
+
+        db.session.commit()
+        return jsonify({"ok": True, "message": "Weekly check-in saved successfully!"})
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"Weekly Submit Error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.get("/api/test/details")
+def test_details():
+    """Fetches all questions and answers for a specific test session"""
+    test_id = request.args.get("test_id")
+    if not test_id:
+        return jsonify({"ok": False, "message": "Missing test_id"}), 400
+
+    try:
+        test_id = int(test_id)
+
+        # Helper dictionary to convert numbers to text answers
+        likert_map = {0: "Never", 1: "Rarely", 2: "Sometimes", 3: "Often", 4: "Always"}
+
+        # 1. Fetch Gate Questions
+        gates = db.session.execute(
+            text("""
+                    SELECT c.Category_Name, cg.Gate_Text, a.Answer_Value
+                    FROM dbo.Student_Test_Answer a
+                    JOIN dbo.Category_Gates cg ON cg.Gate_ID = a.Ref_ID
+                    JOIN dbo.Categories c ON c.Category_ID = cg.Category_ID
+                    WHERE a.Test_ID = :tid AND a.Item_Type = 'Gate'
+                """), {"tid": test_id}
+        ).fetchall()
+
+        # 2. Fetch Base DeepDive Questions
+        bases = db.session.execute(
+            text("""
+                    SELECT c.Category_Name, b.Base_Text, a.Answer_Value
+                    FROM dbo.Student_Test_Answer a
+                    JOIN dbo.DeepDive_Base_Questions b ON b.Base_ID = a.Ref_ID
+                    JOIN dbo.Categories c ON c.Category_ID = b.Category_ID
+                    WHERE a.Test_ID = :tid AND a.Item_Type = 'Base'
+                """), {"tid": test_id}
+        ).fetchall()
+
+        # 3. Fetch Sub DeepDive Questions
+        subs = db.session.execute(
+            text("""
+                    SELECT c.Category_Name, s.Sub_Text, a.Answer_Value
+                    FROM dbo.Student_Test_Answer a
+                    JOIN dbo.DeepDive_Sub_Questions s ON s.Sub_ID = a.Ref_ID
+                    JOIN dbo.DeepDive_Base_Questions b ON b.Base_ID = s.Base_ID
+                    JOIN dbo.Categories c ON c.Category_ID = b.Category_ID
+                    WHERE a.Test_ID = :tid AND a.Item_Type = 'Sub'
+                """), {"tid": test_id}
+        ).fetchall()
+
+        qa_list = []
+
+        # Combine everything into one formatted list for the frontend
+        for cat_name, q_text, val in gates + bases + subs:
+            score = int(val)
+            qa_list.append({
+                "category": cat_name,
+                "question": q_text,
+                "score": score,
+                "answer": likert_map.get(score, str(score))
+            })
+
+        return jsonify({"ok": True, "qa": qa_list})
+
+    except Exception as e:
+        print(f"Details error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.get("/api/daily-results")
+def get_daily_results():
+    """Fetches all daily check-in records for the dashboard calendar and charts"""
+    arid_no = request.args.get("arid_no")
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    try:
+        student_id = get_student_id_by_arid(arid_no)
+        if not student_id:
+            return jsonify({"ok": False, "message": "Student not found"}), 404
+
+        # Fetch ALL columns to ensure we don't starve existing charts of data
+        rows = db.session.execute(
+            text("""
+                    SELECT * FROM dbo.Daily_CheckIn 
+                    WHERE Student_ID = :sid
+                    ORDER BY CheckIn_Date ASC
+                """), {"sid": student_id}
+        ).fetchall()
+
+        results = []
+        for row in rows:
+            # Force the date into a strict YYYY-MM-DD string format safely
+            d = row.CheckIn_Date
+            if hasattr(d, 'strftime'):
+                date_str = d.strftime('%Y-%m-%d')
+            else:
+                date_str = str(d).split(' ')[0]
+
+            results.append({
+                # ---- NEW KEYS (Required for the New Calendar & Modal) ----
+                "date": date_str,
+                "mood": getattr(row, 'Mood_Score', 0),
+                "stress": getattr(row, 'Stress_Score', 0),
+                "anxiety": getattr(row, 'Anxiety_Score', 0),
+                "sleep": getattr(row, 'Sleep_Score', 0),
+                "energy": getattr(row, 'Energy_Score', 0),
+                "notes": getattr(row, 'Notes', ""),
+
+                # ---- LEGACY KEYS (Preserved for Backward Compatibility with Charts) ----
+                "CheckIn_Date": date_str,
+                "Mood_Score": getattr(row, 'Mood_Score', 0),
+                "Stress_Score": getattr(row, 'Stress_Score', 0),
+                "Anxiety_Score": getattr(row, 'Anxiety_Score', 0),
+                "Calculated_Stress_Pct": getattr(row, 'Calculated_Stress_Pct', 0),
+                "Calculated_Anxiety_Pct": getattr(row, 'Calculated_Anxiety_Pct', 0),
+                "Calculated_Depression_Pct": getattr(row, 'Calculated_Depression_Pct', 0),
+                "Severity_Label": getattr(row, 'Severity_Label', "Normal")
+            })
+
+        return jsonify(results)
+
+    except Exception as e:
+        print(f"Daily results error: {e}")
+        return jsonify([]), 500
+
+
+@app.get("/api/weekly-results")
+def get_weekly_results():
+    """Fetches weekly check-in history for the student report screen"""
+    arid_no = request.args.get("arid_no")
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    try:
+        student_id = get_student_id_by_arid(arid_no)
+        if not student_id:
+            return jsonify({"ok": False, "message": "Student not found"}), 404
+
+        # Fetch the historical weekly sessions from the database
+        rows = db.session.execute(
+            text("""
+                    SELECT Triggered_Category_Key, Triggered_Disease, Total_Score, Created_On
+                    FROM dbo.Weekly_CheckIn_Session
+                    WHERE Student_ID = :sid
+                    ORDER BY Created_On DESC
+                """), {"sid": student_id}
+        ).fetchall()
+
+        results = []
+        for row in rows:
+            d = row.Created_On
+            date_str = d.strftime('%Y-%m-%d') if hasattr(d, 'strftime') else str(d).split(' ')[0]
+
+            results.append({
+                "category": row.Triggered_Category_Key,
+                "disease": row.Triggered_Disease,
+                "score": row.Total_Score,
+                "date": date_str
+            })
+
+        return jsonify(results)
+
+    except Exception as e:
+        print(f"Weekly results error: {e}")
+        return jsonify([]), 500
+
+
+@app.get("/api/daily-checkin/mle")
+def get_daily_mles():
+    """Fetches the Universal and Category-Specific MLEs for the daily check-in."""
+    arid_no = request.args.get("arid_no")
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    try:
+        student_id = get_student_id_by_arid(arid_no)
+
+        # Get the triggered category
+        cat_row = db.session.execute(
+            text("""
+                    SELECT TOP 1 c.Category_Key
+                    FROM dbo.Test_Session ts
+                    JOIN dbo.Student_Test_Answer sta ON ts.Test_ID = sta.Test_ID
+                    JOIN dbo.Category_Gates cg ON sta.Ref_ID = cg.Gate_ID
+                    JOIN dbo.Categories c ON cg.Category_ID = c.Category_ID
+                    WHERE ts.Student_ID = :sid AND sta.Item_Type = 'Gate'
+                    ORDER BY ts.Started_On DESC, sta.Answer_Value DESC
+                """), {"sid": student_id}
+        ).fetchone()
+
+        triggered_key = cat_row[0] if cat_row else "AC"
+
+        universal_mle = db.session.execute(text(
+            "SELECT TOP 3 Question_ID, Question_Text FROM dbo.MLE_Questions WHERE Category_Key IS NULL OR Category_Key = 'UN'")).fetchall()
+        specific_mle = db.session.execute(
+            text("SELECT TOP 2 Question_ID, Question_Text FROM dbo.MLE_Questions WHERE Category_Key = :cat"),
+            {"cat": triggered_key}).fetchall()
+
+        return jsonify({
+            "ok": True,
+            "mle_questions": [{"id": q[0], "text": q[1], "type": "Universal"} for q in universal_mle] +
+                             [{"id": q[0], "text": q[1], "type": "Specific"} for q in specific_mle]
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.post("/api/daily-checkin")
+def daily_checkin():
+    data = request.json
+    arid_no = data.get("arid_no")
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    try:
+        sid = get_student_id_by_arid(arid_no)
+        if not sid:
+            return jsonify({"ok": False, "message": "Student not found"}), 404
+
+        checkin_date = data.get("date")
+
+        # 1. Save the Daily Metrics
+        db.session.execute(
+            text("""
+                    MERGE dbo.Daily_CheckIn AS target
+                    USING (VALUES (:sid, :date, :mood, :stress, :anxiety, :sleep, :energy, :notes, :stress_pct, :anxiety_pct, :depression_pct, :severity))
+                    AS source (Student_ID, CheckIn_Date, Mood_Score, Stress_Score, Anxiety_Score, Sleep_Score, Energy_Score, Notes, Calculated_Stress_Pct, Calculated_Anxiety_Pct, Calculated_Depression_Pct, Severity_Label)
+                    ON target.Student_ID = source.Student_ID AND target.CheckIn_Date = source.CheckIn_Date
+                    WHEN MATCHED THEN 
+                        UPDATE SET Mood_Score = source.Mood_Score, Stress_Score = source.Stress_Score, Anxiety_Score = source.Anxiety_Score,
+                                   Sleep_Score = source.Sleep_Score, Energy_Score = source.Energy_Score, Notes = source.Notes,
+                                   Calculated_Stress_Pct = source.Calculated_Stress_Pct, Calculated_Anxiety_Pct = source.Calculated_Anxiety_Pct,
+                                   Calculated_Depression_Pct = source.Calculated_Depression_Pct, Severity_Label = source.Severity_Label
+                    WHEN NOT MATCHED THEN
+                        INSERT (Student_ID, CheckIn_Date, Mood_Score, Stress_Score, Anxiety_Score, Sleep_Score, Energy_Score, Notes, Calculated_Stress_Pct, Calculated_Anxiety_Pct, Calculated_Depression_Pct, Severity_Label)
+                        VALUES (source.Student_ID, source.CheckIn_Date, source.Mood_Score, source.Stress_Score, source.Anxiety_Score, source.Sleep_Score, source.Energy_Score, source.Notes, source.Calculated_Stress_Pct, source.Calculated_Anxiety_Pct, source.Calculated_Depression_Pct, source.Severity_Label);
+                """),
+            {
+                "sid": sid, "date": checkin_date,
+                "mood": data.get("responses", {}).get("mood"), "stress": data.get("responses", {}).get("stress"),
+                "anxiety": data.get("responses", {}).get("anxiety"), "sleep": data.get("responses", {}).get("sleep"),
+                "energy": data.get("responses", {}).get("energy"), "notes": data.get("notes", ""),
+                "stress_pct": data.get("stress"), "anxiety_pct": data.get("anxiety"),
+                "depression_pct": data.get("depression"), "severity": data.get("severity")
+            }
+        )
+
+        # 2. Save the Daily MLE Answers
+        mle_answers = data.get("mle_answers", [])
+        for ans in mle_answers:
+            db.session.execute(
+                text("""
+                    INSERT INTO dbo.MLE_Answers (Student_ID, CheckIn_Date, Question_ID, Answer_Value)
+                    VALUES (:sid, :date, :q_id, :val)
+                """),
+                {"sid": sid, "date": checkin_date, "q_id": ans["id"], "val": ans["value"]}
+            )
+
+        # 3. Update Completed Remedies
+        completed_ids = data.get("completed_remedy_ids", [])
+        if completed_ids:
+            latest_test = db.session.execute(
+                text("SELECT TOP 1 Test_ID FROM dbo.Test_Session WHERE Student_ID = :sid ORDER BY Started_On DESC"),
+                {"sid": sid}).scalar()
+            for rid in completed_ids:
+                try:
+                    db.session.execute(text(
+                        "EXEC dbo.sp_RecordRemedyFeedback @Student_ID=:sid, @Test_ID=:tid, @Remedy_ID=:rid, @Status='Completed', @Rating=NULL, @Feedback_Text='Marked via Daily Check-in', @Dismissed_Reason=NULL"),
+                                       {"sid": sid, "tid": latest_test, "rid": int(rid)})
+                except ValueError:
+                    pass
+
+        db.session.commit()
+        return jsonify({"ok": True, "message": "Daily check-in and MLEs saved!"})
+
+    except Exception as e:
+        db.session.rollback()
+        print(f"Daily check-in error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+# --- WEEKLY WELLNESS QUESTIONS ---
+@app.route("/api/admin/weekly_questions", methods=["GET", "POST", "PUT", "DELETE"])
+def admin_weekly_questions():
+    if request.method == "GET":
+        rows = db.session.execute(text("""
+            SELECT w.Question_ID, w.Category_Key, c.Category_Name, w.Question_Text, w.Is_Reversed 
+            FROM dbo.Weekly_Wellness_Questions w
+            LEFT JOIN dbo.Categories c ON w.Category_Key = c.Category_Key
+        """)).fetchall()
+        data = [{"Question_ID": r[0], "Category_Key": r[1], "Category_Name": r[2] or "Unknown", "Question_Text": r[3],
+                 "Is_Reversed": bool(r[4])} for r in rows]
+        return jsonify({"ok": True, "data": data})
+
+    elif request.method == "POST":
+        d = request.json
+        try:
+            db.session.execute(
+                text(
+                    "INSERT INTO dbo.Weekly_Wellness_Questions (Category_Key, Question_Text, Is_Reversed, Is_Active) VALUES (:cat, :text, :rev, 1)"),
+                {"cat": d.get("Category_Key"), "text": d.get("Question_Text"), "rev": 1 if d.get("Is_Reversed") else 0}
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Weekly Question added!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "PUT":
+        d = request.json
+        try:
+            db.session.execute(
+                text(
+                    "UPDATE dbo.Weekly_Wellness_Questions SET Category_Key=:cat, Question_Text=:text, Is_Reversed=:rev WHERE Question_ID=:id"),
+                {"cat": d.get("Category_Key"), "text": d.get("Question_Text"), "rev": 1 if d.get("Is_Reversed") else 0,
+                 "id": d.get("Question_ID")}
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Weekly Question updated!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "DELETE":
+        try:
+            db.session.execute(text("DELETE FROM dbo.Weekly_Wellness_Questions WHERE Question_ID=:id"),
+                               {"id": request.json.get("id")})
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Weekly Question deleted!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+
+# --- DAILY MLE QUESTIONS ---
+@app.route("/api/admin/mle_questions", methods=["GET", "POST", "PUT", "DELETE"])
+def admin_mle_questions():
+    if request.method == "GET":
+        rows = db.session.execute(text("""
+            SELECT m.Question_ID, m.Category_Key, c.Category_Name, m.Question_Text 
+            FROM dbo.MLE_Questions m
+            LEFT JOIN dbo.Categories c ON m.Category_Key = c.Category_Key
+        """)).fetchall()
+        data = [{"Question_ID": r[0], "Category_Key": r[1], "Category_Name": r[2] or "Universal (All Students)",
+                 "Question_Text": r[3]} for r in rows]
+        return jsonify({"ok": True, "data": data})
+
+    elif request.method == "POST":
+        d = request.json
+        cat_key = d.get("Category_Key")
+        cat_key = cat_key if cat_key else None  # Convert empty string to NULL for Universal questions
+        try:
+            db.session.execute(
+                text("INSERT INTO dbo.MLE_Questions (Category_Key, Question_Text, Is_Active) VALUES (:cat, :text, 1)"),
+                {"cat": cat_key, "text": d.get("Question_Text")}
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "MLE Question added!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "PUT":
+        d = request.json
+        cat_key = d.get("Category_Key")
+        cat_key = cat_key if cat_key else None
+        try:
+            db.session.execute(
+                text("UPDATE dbo.MLE_Questions SET Category_Key=:cat, Question_Text=:text WHERE Question_ID=:id"),
+                {"cat": cat_key, "text": d.get("Question_Text"), "id": d.get("Question_ID")}
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "MLE Question updated!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "DELETE":
+        try:
+            db.session.execute(text("DELETE FROM dbo.MLE_Questions WHERE Question_ID=:id"),
+                               {"id": request.json.get("id")})
+            db.session.commit()
+            return jsonify({"ok": True, "message": "MLE Question deleted!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+
+@app.get("/api/advisor/all-students")
+def get_all_assigned_students():
+    """Fetches all students assigned to an advisor"""
+    adv_id = request.args.get("advisor_id")
+    if not adv_id:
+        return jsonify({"ok": False, "message": "Missing advisor_id"}), 400
+
+    try:
+        students = db.session.execute(
+            text("SELECT Student_ID, Student_Name, Arid_No FROM dbo.Students WHERE Advisor_ID = :aid"),
+            {"aid": adv_id}
+        ).fetchall()
+
+        return jsonify({
+            "ok": True,
+            "students": [{"id": r[0], "name": r[1], "arid": r[2]} for r in students]
+        })
+    except Exception as e:
+        print(f"All students fetch error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+# ==========================================
+# CLINICAL ASSESSMENT BUILDER ENDPOINTS
+# ==========================================
+
+# ==========================================
+# CLINICAL ASSESSMENT BUILDER ENDPOINTS
+# ==========================================
+
+# --- CATEGORIES ---
+@app.route("/api/clinical/categories", methods=["GET", "POST", "PUT", "DELETE"])
+def clinical_categories():
+    if request.method == "GET":
+        rows = db.session.execute(text("""
+            SELECT Category_ID, Category_Key, Category_Name, Category_Weight, Base_Trigger_Min_Value, Category_Short_Name 
+            FROM dbo.Categories
+        """)).fetchall()
+        data = [{"Category_ID": r[0], "Category_Key": r[1], "Category_Name": r[2], "Category_Weight": r[3],
+                 "Base_Trigger_Min_Value": r[4], "Category_Short_Name": r[5]} for r in rows]
+        return jsonify({"ok": True, "data": data})
+
+    elif request.method == "POST":
+        d = request.json
+        try:
+            # Schema requires: Category_Key (nvarchar(10)), Base_Trigger_Min_Value (int NOT NULL)
+            db.session.execute(
+                text("""
+                    INSERT INTO dbo.Categories 
+                    (Category_Key, Category_Name, Category_Weight, Base_Trigger_Min_Value, Is_Active, Category_Short_Name) 
+                    VALUES (:key, :name, :wt, :trig, 1, :short)
+                """),
+                {
+                    "key": str(d.get("Category_Key", "")).strip(),
+                    "name": str(d.get("Category_Name", "")).strip(),
+                    "wt": float(d.get("Category_Weight") or 1.0),
+                    "trig": int(d.get("Base_Trigger_Min_Value", 3)),
+                    "short": str(d.get("Category_Short_Name") or d.get("Category_Name", "")).strip()
+                }
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Category added successfully!"})
+        except Exception as e:
+            db.session.rollback()
+            print(f"Category POST error: {e}")
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "PUT":
+        d = request.json
+        try:
+            db.session.execute(
+                text("""
+                    UPDATE dbo.Categories 
+                    SET Category_Key=:key, Category_Name=:name, Category_Weight=:wt, 
+                        Base_Trigger_Min_Value=:trig, Category_Short_Name=:short
+                    WHERE Category_ID=:id
+                """),
+                {
+                    "key": str(d.get("Category_Key", "")).strip(),
+                    "name": str(d.get("Category_Name", "")).strip(),
+                    "wt": float(d.get("Category_Weight") or 1.0),
+                    "trig": int(d.get("Base_Trigger_Min_Value", 3)),
+                    "short": str(d.get("Category_Short_Name") or d.get("Category_Name", "")).strip(),
+                    "id": int(d.get("Category_ID"))
+                }
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Category updated!"})
+        except Exception as e:
+            db.session.rollback()
+            print(f"Category PUT error: {e}")
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "DELETE":
+        try:
+            db.session.execute(text("DELETE FROM dbo.Categories WHERE Category_ID=:id"),
+                               {"id": int(request.json.get("id"))})
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Category deleted!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": "Cannot delete Category. It has linked questions."}), 400
+
+
+# --- BASE QUESTIONS ---
+@app.route("/api/clinical/base_questions", methods=["GET", "POST", "PUT", "DELETE"])
+def clinical_base_questions():
+    if request.method == "GET":
+        cat_id = request.args.get("category_id")
+        if cat_id:
+            rows = db.session.execute(text("""
+                SELECT b.Base_ID, b.Category_ID, c.Category_Name, b.Base_Theme, b.Base_Text, b.Weight, b.Trigger_Min_Value, b.Base_Order 
+                FROM dbo.DeepDive_Base_Questions b
+                JOIN dbo.Categories c ON b.Category_ID = c.Category_ID
+                WHERE b.Category_ID = :cid
+                ORDER BY b.Base_Order ASC
+            """), {"cid": int(cat_id)}).fetchall()
+        else:
+            rows = db.session.execute(text("""
+                SELECT b.Base_ID, b.Category_ID, c.Category_Name, b.Base_Theme, b.Base_Text, b.Weight, b.Trigger_Min_Value, b.Base_Order 
+                FROM dbo.DeepDive_Base_Questions b
+                JOIN dbo.Categories c ON b.Category_ID = c.Category_ID
+                ORDER BY b.Category_ID ASC, b.Base_Order ASC
+            """)).fetchall()
+        data = [{"Base_ID": r[0], "Category_ID": r[1], "Category_Name": r[2], "Base_Theme": r[3],
+                 "Base_Text": r[4], "Weight": r[5], "Trigger_Min_Value": r[6], "Base_Order": r[7]} for r in rows]
+        return jsonify({"ok": True, "data": data})
+
+    elif request.method == "POST":
+        d = request.json
+        default_json = '{"Never":0,"Rarely":1,"Sometimes":2,"Often":3,"Always":4}'
+        try:
+            cid = int(d.get("Category_ID"))
+
+            # FIX: Auto-calculate next Base_Order to avoid UNIQUE constraint violation
+            max_order_row = db.session.execute(
+                text("SELECT MAX(Base_Order) FROM dbo.DeepDive_Base_Questions WHERE Category_ID = :cid"),
+                {"cid": cid}
+            ).fetchone()
+            next_order = (max_order_row[0] or 0) + 10
+
+            db.session.execute(
+                text("""INSERT INTO dbo.DeepDive_Base_Questions 
+                        (Category_ID, Base_Theme, Base_Text, Weight, Trigger_Min_Value, Input_Type, Options_JSON, Is_Active, Base_Order) 
+                        VALUES (:cid, :theme, :text, :wt, :trig, 'Scale', :json, 1, :ord)"""),
+                {
+                    "cid": cid,
+                    "theme": str(d.get("Base_Theme") or "").strip(),
+                    "text": str(d.get("Base_Text", "")).strip(),
+                    "wt": int(d.get("Weight") or 1),
+                    "trig": int(d.get("Trigger_Min_Value")) if d.get("Trigger_Min_Value") is not None else None,
+                    "json": default_json,
+                    "ord": next_order
+                }
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Base Question added!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "PUT":
+        d = request.json
+        try:
+            db.session.execute(
+                text("""UPDATE dbo.DeepDive_Base_Questions 
+                        SET Category_ID=:cid, Base_Theme=:theme, Base_Text=:text, Weight=:wt, 
+                            Trigger_Min_Value=:trig, Base_Order=:ord 
+                        WHERE Base_ID=:id"""),
+                {
+                    "cid": int(d.get("Category_ID")),
+                    "theme": str(d.get("Base_Theme") or "").strip(),
+                    "text": str(d.get("Base_Text", "")).strip(),
+                    "wt": int(d.get("Weight") or 1),
+                    "trig": int(d.get("Trigger_Min_Value")) if d.get("Trigger_Min_Value") is not None else None,
+                    "id": int(d.get("Base_ID")),
+                    "ord": int(d.get("Base_Order") or 99)
+                }
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Base Question updated!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "DELETE":
+        try:
+            db.session.execute(text("DELETE FROM dbo.DeepDive_Base_Questions WHERE Base_ID=:id"),
+                               {"id": int(request.json.get("id"))})
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Base Question deleted!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": "Cannot delete. It has linked sub-questions."}), 400
+
+
+# --- SUB QUESTIONS ---
+@app.route("/api/clinical/sub_questions", methods=["GET", "POST", "PUT", "DELETE"])
+def clinical_sub_questions():
+    if request.method == "GET":
+        base_id = request.args.get("base_id")
+        cat_id = request.args.get("category_id")
+        if base_id:
+            rows = db.session.execute(text("""
+                SELECT s.Sub_ID, s.Base_ID, b.Base_Theme, s.Sub_Text, s.Weight, s.Sub_Order
+                FROM dbo.DeepDive_Sub_Questions s
+                JOIN dbo.DeepDive_Base_Questions b ON s.Base_ID = b.Base_ID
+                WHERE s.Base_ID = :bid
+                ORDER BY s.Sub_Order ASC
+            """), {"bid": int(base_id)}).fetchall()
+        elif cat_id:
+            rows = db.session.execute(text("""
+                SELECT s.Sub_ID, s.Base_ID, b.Base_Theme, s.Sub_Text, s.Weight, s.Sub_Order
+                FROM dbo.DeepDive_Sub_Questions s
+                JOIN dbo.DeepDive_Base_Questions b ON s.Base_ID = b.Base_ID
+                WHERE b.Category_ID = :cid
+                ORDER BY s.Base_ID ASC, s.Sub_Order ASC
+            """), {"cid": int(cat_id)}).fetchall()
+        else:
+            rows = db.session.execute(text("""
+                SELECT s.Sub_ID, s.Base_ID, b.Base_Theme, s.Sub_Text, s.Weight, s.Sub_Order
+                FROM dbo.DeepDive_Sub_Questions s
+                JOIN dbo.DeepDive_Base_Questions b ON s.Base_ID = b.Base_ID
+                ORDER BY s.Base_ID ASC, s.Sub_Order ASC
+            """)).fetchall()
+        data = [{"Sub_ID": r[0], "Base_ID": r[1], "Base_Theme": r[2], "Sub_Text": r[3],
+                 "Weight": r[4], "Sub_Order": r[5]} for r in rows]
+        return jsonify({"ok": True, "data": data})
+
+    elif request.method == "POST":
+        d = request.json
+        default_json = '{"Never":0,"Rarely":1,"Sometimes":2,"Often":3,"Always":4}'
+        try:
+            bid = int(d.get("Base_ID"))
+
+            # FIX: Auto-calculate next Sub_Order to avoid UNIQUE constraint violation
+            max_order_row = db.session.execute(
+                text("SELECT MAX(Sub_Order) FROM dbo.DeepDive_Sub_Questions WHERE Base_ID = :bid"),
+                {"bid": bid}
+            ).fetchone()
+            next_order = (max_order_row[0] or 0) + 10
+
+            db.session.execute(
+                text("""INSERT INTO dbo.DeepDive_Sub_Questions 
+                        (Base_ID, Sub_Text, Weight, Input_Type, Options_JSON, Is_Active, Sub_Order) 
+                        VALUES (:bid, :text, :wt, 'Scale', :json, 1, :ord)"""),
+                {
+                    "bid": bid,
+                    "text": str(d.get("Sub_Text", "")).strip(),
+                    "wt": int(d.get("Weight") or 1),
+                    "json": default_json,
+                    "ord": next_order
+                }
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Sub Question added!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "PUT":
+        d = request.json
+        try:
+            db.session.execute(
+                text("""UPDATE dbo.DeepDive_Sub_Questions 
+                        SET Base_ID=:bid, Sub_Text=:text, Weight=:wt, Sub_Order=:ord 
+                        WHERE Sub_ID=:id"""),
+                {
+                    "bid": int(d.get("Base_ID")),
+                    "text": str(d.get("Sub_Text", "")).strip(),
+                    "wt": int(d.get("Weight") or 1),
+                    "id": int(d.get("Sub_ID")),
+                    "ord": int(d.get("Sub_Order") or 99)
+                }
+            )
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Sub Question updated!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+    elif request.method == "DELETE":
+        try:
+            db.session.execute(text("DELETE FROM dbo.DeepDive_Sub_Questions WHERE Sub_ID=:id"),
+                               {"id": int(request.json.get("id"))})
+            db.session.commit()
+            return jsonify({"ok": True, "message": "Sub Question deleted!"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"ok": False, "message": str(e)}), 400
+
+
+# ==========================================
+# STUDENT SUGGESTED REMEDIES ENDPOINT
+# Add this before the `if __name__ == "__main__":` line
+# ==========================================
+
+@app.get("/api/student/suggested-remedies")
+def get_student_suggested_remedies():
+    """
+    Returns the remedies that WOULD be suggested to a student based on their
+    latest completed test session. Used by the advisor/psychologist profile modal
+    to show what remedies are currently recommended for the student.
+    """
+    arid_no = request.args.get("arid_no")
+    if not arid_no:
+        return jsonify({"ok": False, "message": "Missing arid_no"}), 400
+
+    try:
+        student_id = get_student_id_by_arid(arid_no)
+        if not student_id:
+            return jsonify({"ok": False, "message": "Student not found"}), 404
+
+        # Get the latest test session that has actual answers
+        latest_test = db.session.execute(
+            text("""
+                SELECT TOP 1 ts.Test_ID
+                FROM dbo.Test_Session ts
+                JOIN dbo.Student_Test_Answer sta ON sta.Test_ID = ts.Test_ID
+                WHERE ts.Student_ID = :sid
+                ORDER BY ts.Started_On DESC
+            """),
+            {"sid": student_id}
+        ).fetchone()
+
+        if not latest_test:
+            return jsonify({
+                "ok": True,
+                "remedies": [],
+                "summary": None,
+                "message": "No completed assessment found."
+            })
+
+        test_id = int(latest_test[0])
+
+        # Build summary using existing scoring engine
+        summary = build_test_summary(test_id)
+        student_context = map_profile_context(student_id)
+
+        # Fetch remedies using existing remedy engine (no duration cap for advisor view)
+        remedies = safe_fetch_remedies(summary, student_context, max_duration=999)
+
+        return jsonify({
+            "ok": True,
+            "remedies": remedies,
+            "summary": {
+                "dominant_disease": summary["Dominant_Disease"],
+                "severity": summary["Severity"],
+                "test_id": test_id,
+                "bucket_pct": summary["bucket_pct"]
+            }
+        })
+
+    except Exception as e:
+        print(f"Student suggested remedies error: {e}")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
